@@ -1,20 +1,22 @@
-### Dependencies
+# Roadrunner RP2040-zero Firmware
 
-```
+## Dependencies
+
+```sh
 sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
 ```
 
-### Configuring
+## Configuring
 
 Some neopixels have RGB color ordering while others have GRB. When the filament is inserted the LED should ligth green, if it is RED then you should use the GRB ordering. Uncomment the following line in `neopixel.h` and re-run `make` to build the firmware.
 
-```
+```c
 #define GRB_LED_ORDER 1
 ```
 
-### Building
+## Building
 
-```
+```sh
 git clone https://github.com/Vylyne/roadrunner.git roadrunner-filament-sensor
 cd roadrunner-filament-sensor
 git submodule update --init --recursive
@@ -27,7 +29,7 @@ make
 
 You'll find multiple `.uf2` files in the `roadrunner-filament-sensor/rp2040/build` directory. The name contains `uart`, `i2c` or `usbserial` for the communication mode between mcu and sensor, and `rgb` vs `grb` for the neopixel type.
 
-### Flashing
+## Flashing
 
 1. Connect RP2040-Zero to computer via USB
 2. Press `BOOT` and `RESET` at the same time
