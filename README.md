@@ -21,7 +21,6 @@
 
 ## TODO
 
-- [ ] Make the I2C transport failure log identify the sensor, MCU, and bus.
 - [ ] Design and test persistent provisioned device UUIDs; do not rely on
   RP2040 BOOTSEL USB serials as unique.
 - [ ] Add a safe, recoverable Katapult and mcu-updater provisioning path.

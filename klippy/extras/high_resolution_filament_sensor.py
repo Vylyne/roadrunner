@@ -157,9 +157,10 @@ class RegisterReaderUART(RegisterReaderGeneric):
             return val
 
 class RegisterReaderI2C(RegisterReaderGeneric):
-    def __init__(self, i2c):
+    def __init__(self, i2c, sensor_name):
         self.i2c = i2c
-        self.printer = i2c.mcu.get_printer()
+        self.printer = i2c.get_mcu().get_printer()
+        self.sensor_name = sensor_name
 
     def read(self):
         data = self.i2c_read_reg(SensorRegister.ALL, 10)
@@ -182,7 +183,12 @@ class RegisterReaderI2C(RegisterReaderGeneric):
             params = self.i2c.i2c_read([reg], length)
             return bytearray(params['response'])
         except (serialhdl.error, self.printer.command_error) as e:
-            logging.warning(f"{self.name}: Unable to read: {e}")
+            mcu_name = self.i2c.get_mcu().get_name()
+            bus_name = self.i2c.bus or "default"
+            logging.warning(
+                f"{self.sensor_name}: Unable to read via I2C "
+                f"(MCU '{mcu_name}', bus '{bus_name}'): {e}"
+            )
             return
 
 class RegisterReaderSerial(RegisterReaderGeneric):
@@ -543,7 +549,7 @@ class HighResolutionFilamentSensor:
             self.regs = RegisterReaderUART(uart)
         else:
             i2c = bus.MCU_I2C_from_config(config, DEFAULT_I2C_TARGET_ADDR, DEFAULT_I2C_SPEED)
-            self.regs = RegisterReaderI2C(i2c)
+            self.regs = RegisterReaderI2C(i2c, self.name)
 
         self.extruder_name = config.get('extruder')
         self.invert_direction = config.getboolean('invert_direction', False)
