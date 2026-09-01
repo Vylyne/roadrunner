@@ -1,4 +1,12 @@
+# IDE environment
+.vscode/
+*.code-workspace
+
+# build and python stuff
 rp2040/build/
 rp2040/generated/
 script/__pycache__/
 script/venv/
+
+# Firmware releases are built and published by GitHub Actions.
+*.uf2

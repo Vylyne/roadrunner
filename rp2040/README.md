@@ -15,7 +15,7 @@ Some neopixels have RGB color ordering while others have GRB. When the filament 
 ### Building
 
 ```
-git clone https://github.com/EiNSTeiN-/roadrunner-filament-sensor.git
+git clone https://github.com/Vylyne/roadrunner.git roadrunner-filament-sensor
 cd roadrunner-filament-sensor
 git submodule update --init --recursive
 cd rp2040

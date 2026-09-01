@@ -2,17 +2,31 @@
 
 ![Preview](images/assembly.png)
 
-### Features
+## Contents
 
-* **High resolution** sub-millimeter motion detection
-* **Low cost** at approx. ~12$ USD for parts on Aliexpress
-* **Detect direction** (extruding or reversing) unlike pulse-based motion sensors
-* Detect changes of **0.7 degree** or 0.04mm based on a 24mm rotation distance
-* **Neopixel status indicator** for filament removed, filament inserted, filament moving
-* **Small and light** at half the size of some commercial products
-* **Helps determine runout reason** between filament runout, filament jams, or partial under-extrusion
-* **2-wire communication** with mcu, over UART or I2C (suits most boards)
-* **Calibrates max flow** with helpful gcode command.
+- [Features](#features)
+- [TODO](#todo)
+- [Build guide](#build-guide)
+- [Klipper installation](#klipper-installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+
+## Features
+
+- [x] High-resolution, sub-millimetre motion detection
+- [x] Direction detection for extrusion and retraction
+- [x] Filament-presence detection and NeoPixel status indication
+- [x] UART, I2C, and USB-serial sensor transports
+- [x] Klipper runout, under-extrusion, and calibration support
+
+## TODO
+
+- [ ] Make the I2C transport failure log identify the sensor, MCU, and bus.
+- [ ] Design and test persistent provisioned device UUIDs; do not rely on
+  RP2040 BOOTSEL USB serials as unique.
+- [ ] Add a safe, recoverable Katapult and mcu-updater provisioning path.
+- [ ] Add GitHub Actions firmware build and release artifacts, plus repeatable
+  protocol validation on a bench board.
 
 Most 3D printer motion sensors are bulky, slow to trigger, prone to false positives, and have a high detection distance meaning a large amount material is extruded before actually detecting a runout, leading to poor layer adhesion and failed prints after a runout.
 
@@ -20,19 +34,19 @@ The Roadrunner motion sensor is based on a magnetic rotary encoder which can det
 
 By leveraging the higher precision of the sensor, it's possible to determine the length, speed and volumetric flow that are expected and compare them to the actual measured values in real time which gives us a reasonable approximation of _how much_ the filament is being under-extruded by. A simple to use `CALIBRATE_MAX_FLOW` command is provided to perform free-air extrusion tests and automatically benchmark the maximum volumetric flow of any temperature/nozzle/material combination.
 
-### Build guide
+## Build guide
 
 This is an open-source project, so you can build your own!
 
 See the [bill of material](manual/BOM.md) and the [assembly manual](manual/ASSEMBLY.md).
 
-### Klipper installation
+## Klipper installation
 
 Clone the repository and create a symlink to the sensor code:
 
 ```
 cd ~
-git clone --depth 1 --single-branch https://github.com/EiNSTeiN-/roadrunner-filament-sensor.git
+git clone --depth 1 --single-branch https://github.com/Vylyne/roadrunner.git roadrunner-filament-sensor
 ~/roadrunner-filament-sensor/install.sh
 ```
 
@@ -46,13 +60,13 @@ To get automatic updates within moonraker, add the following block at the end of
 [update_manager roadrunner-filament-sensor]
 type: git_repo
 path: ~/roadrunner-filament-sensor
-origin: https://github.com/EiNSTeiN-/roadrunner-filament-sensor.git
+origin: https://github.com/Vylyne/roadrunner.git
 install_script: install.sh
 primary_branch: main
 managed_services: klipper
 ```
 
-### Configuration
+## Configuration
 
 Add the following configuration to your `printer.cfg`:
 
@@ -121,7 +135,7 @@ event_delay: 0.1
 ```
 
 
-### Usage
+## Usage
 
 ##### Calibration cheat sheet
 
