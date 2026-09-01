@@ -2,6 +2,7 @@
 .vscode/
 *.code-workspace
 NOTES.md
+docs/superpowers/
 
 # build and python stuff
 rp2040/build/
