@@ -32,7 +32,7 @@ USB descriptors and INFO use the same serial formatter.
 All maintenance traffic remains available only on Roadrunner's direct USB CDC
 port. The existing frame remains:
 
-```
+```c
 0x52 0x52 0x01 opcode payload_length payload crc8
 ```
 
