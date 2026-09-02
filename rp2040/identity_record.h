@@ -20,7 +20,11 @@ enum rr_identity_result {
     RR_IDENTITY_NONE,
     RR_IDENTITY_OK,
     RR_IDENTITY_CONFLICT,
+    RR_IDENTITY_ALREADY_PROVISIONED,
+    RR_IDENTITY_IO_ERROR,
 };
+
+typedef enum rr_identity_result rr_identity_status_t;
 
 bool rr_identity_record_valid(
     const uint8_t slot[ROADRUNNER_IDENTITY_RECORD_SIZE]);

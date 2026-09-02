@@ -7,6 +7,7 @@ enable_testing()
 add_executable(roadrunner_identity_tests
     test_identity_record.c
     ../identity_record.c
+    ../identity_store.c
 )
 target_include_directories(roadrunner_identity_tests PRIVATE ..)
 
