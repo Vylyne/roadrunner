@@ -1,5 +1,6 @@
 #include "identity_record.h"
 #include "identity_store.h"
+#include "usb_admin.h"
 #include "usb_descriptor_strings.h"
 #include <assert.h>
 #include <stdint.h>
@@ -86,6 +87,167 @@ static void make_valid_record(uint8_t slot[ROADRUNNER_IDENTITY_RECORD_SIZE],
     slot[TEST_CRC_OFFSET + 2] = (uint8_t)(crc >> 16);
     slot[TEST_CRC_OFFSET + 3] = (uint8_t)(crc >> 24);
     slot[TEST_VALID_MARKER_OFFSET] = 0;
+}
+
+struct usb_admin_test_io {
+    uint8_t response[128];
+    size_t response_length;
+    uint8_t legacy_bytes[16];
+    size_t legacy_length;
+    bool rebooted;
+    char events[8];
+    size_t event_length;
+};
+
+static void usb_admin_test_write(void *context, const uint8_t *data,
+                                 size_t length) {
+    struct usb_admin_test_io *io = context;
+
+    assert(length <= sizeof(io->response) - io->response_length);
+    memcpy(io->response + io->response_length, data, length);
+    io->response_length += length;
+    io->events[io->event_length++] = 'W';
+}
+
+static void usb_admin_test_legacy_byte(void *context, uint8_t byte) {
+    struct usb_admin_test_io *io = context;
+
+    assert(io->legacy_length < sizeof(io->legacy_bytes));
+    io->legacy_bytes[io->legacy_length++] = byte;
+}
+
+static void usb_admin_test_flush(void *context) {
+    struct usb_admin_test_io *io = context;
+
+    io->events[io->event_length++] = 'F';
+}
+
+static bool usb_admin_test_transmit_complete(void *context) {
+    struct usb_admin_test_io *io = context;
+
+    io->events[io->event_length++] = 'T';
+    return true;
+}
+
+static void usb_admin_test_reboot_bootsel(void *context) {
+    struct usb_admin_test_io *io = context;
+
+    io->rebooted = true;
+    io->events[io->event_length++] = 'R';
+}
+
+static void test_usb_admin_info_frame(void) {
+    static const uint8_t request[] = {0x52, 0x52, 0x01, 0x01, 0x00, 0x90};
+    static const uint8_t expected_response[] = {
+        0x52, 0x52, 0x01, 0x81, 0x3d,
+        0x00, 0x01, 0x03, 0x02, 0x0d,
+        0x72, 0x6f, 0x61, 0x64, 0x72, 0x75, 0x6e, 0x6e, 0x65, 0x72,
+        0x2d, 0x76, 0x31,
+        0x03, 0x64, 0x65, 0x76,
+        0x1e, 0x52, 0x52, 0x31, 0x2d,
+        0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+        0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+        0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x91,
+    };
+    struct rr_identity identity = {0};
+    static const uint8_t flash_uid[RR_USB_ADMIN_FLASH_UID_SIZE] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    };
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = {
+        .identity_status = RR_IDENTITY_OK,
+        .identity = &identity,
+        .flash_uid = flash_uid,
+        .transport = RR_USB_ADMIN_TRANSPORT_USB,
+        .led_order = RR_USB_ADMIN_LED_GRB,
+        .firmware_version = "dev",
+        .context = &io,
+        .write = usb_admin_test_write,
+        .legacy_byte = usb_admin_test_legacy_byte,
+        .flush = usb_admin_test_flush,
+        .transmit_complete = usb_admin_test_transmit_complete,
+        .reboot_bootsel = usb_admin_test_reboot_bootsel,
+    };
+
+    rr_usb_admin_init(&config);
+    for (size_t index = 0; index < sizeof(request); ++index) {
+        rr_usb_admin_receive(request[index]);
+    }
+
+    assert(io.legacy_length == 0);
+    assert(io.response_length == sizeof(expected_response));
+    assert(memcmp(io.response, expected_response, sizeof(expected_response)) == 0);
+}
+
+static void test_usb_admin_preserves_legacy_register_traffic(void) {
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = {
+        .context = &io,
+        .legacy_byte = usb_admin_test_legacy_byte,
+        .flush = usb_admin_test_flush,
+        .transmit_complete = usb_admin_test_transmit_complete,
+        .reboot_bootsel = usb_admin_test_reboot_bootsel,
+    };
+
+    rr_usb_admin_init(&config);
+    rr_usb_admin_receive(0xf5);
+    rr_usb_admin_receive(0x10);
+
+    assert(io.response_length == 0);
+    assert(io.legacy_length == 2);
+    assert(io.legacy_bytes[0] == 0xf5);
+    assert(io.legacy_bytes[1] == 0x10);
+}
+
+static void test_usb_admin_rejects_bad_crc(void) {
+    static const uint8_t request[] = {0x52, 0x52, 0x01, 0x01, 0x00, 0x00};
+    static const uint8_t expected_response[] = {
+        0x52, 0x52, 0x01, 0x81, 0x01, 0x01, 0xe0,
+    };
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = {
+        .context = &io,
+        .write = usb_admin_test_write,
+        .flush = usb_admin_test_flush,
+        .transmit_complete = usb_admin_test_transmit_complete,
+        .reboot_bootsel = usb_admin_test_reboot_bootsel,
+    };
+
+    rr_usb_admin_init(&config);
+    for (size_t index = 0; index < sizeof(request); ++index) {
+        rr_usb_admin_receive(request[index]);
+    }
+
+    assert(io.response_length == sizeof(expected_response));
+    assert(memcmp(io.response, expected_response, sizeof(expected_response)) == 0);
+}
+
+static void test_usb_admin_acknowledges_before_bootsel_reboot(void) {
+    static const uint8_t request[] = {0x52, 0x52, 0x01, 0x02, 0x00, 0xaf};
+    static const uint8_t expected_response[] = {
+        0x52, 0x52, 0x01, 0x82, 0x01, 0x00, 0x5a,
+    };
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = {
+        .context = &io,
+        .write = usb_admin_test_write,
+        .flush = usb_admin_test_flush,
+        .transmit_complete = usb_admin_test_transmit_complete,
+        .reboot_bootsel = usb_admin_test_reboot_bootsel,
+    };
+
+    rr_usb_admin_init(&config);
+    for (size_t index = 0; index < sizeof(request); ++index) {
+        rr_usb_admin_receive(request[index]);
+    }
+
+    assert(io.response_length == sizeof(expected_response));
+    assert(memcmp(io.response, expected_response, sizeof(expected_response)) == 0);
+    assert(io.rebooted);
+    assert(io.event_length == 4);
+    assert(memcmp(io.events, "WFTR", io.event_length) == 0);
 }
 
 int main(void) {
@@ -188,5 +350,9 @@ int main(void) {
                                     NULL, flash_uid);
     assert(strcmp(descriptor_strings.serial,
                   "RR1-UNPROVISIONED-0123456789ABCDEF") == 0);
+    test_usb_admin_info_frame();
+    test_usb_admin_preserves_legacy_register_traffic();
+    test_usb_admin_rejects_bad_crc();
+    test_usb_admin_acknowledges_before_bootsel_reboot();
     return 0;
 }

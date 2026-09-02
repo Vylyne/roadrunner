@@ -18,12 +18,11 @@
 - [x] Filament-presence detection and NeoPixel status indication
 - [x] UART, I2C, and USB-serial sensor transports
 - [x] Klipper runout, under-extrusion, and calibration support
+- [x] Persistent provisioned device identities with safe USB diagnostics
+- [x] Direct USB maintenance and ROM BOOTSEL recovery
 
 ## TODO
 
-- [ ] Design and test persistent provisioned device UUIDs; do not rely on
-  RP2040 BOOTSEL USB serials as unique.
-- [ ] Add a safe, recoverable Katapult and mcu-updater provisioning path.
 - [ ] Add GitHub Actions firmware build and release artifacts, plus repeatable
   protocol validation on a bench board.
 

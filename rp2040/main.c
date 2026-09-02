@@ -11,6 +11,8 @@
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
+#include "pico/unique_id.h"
+#include "tusb.h"
 
 #include "neopixel.h"
 #include "as5600.h"
@@ -19,8 +21,51 @@
 #include "i2c_target.h"
 #include "usbserial.h"
 #include "identity_store.h"
+#include "usb_admin.h"
 
 void rr_usb_descriptors_init(const struct rr_identity_store *store);
+
+static struct rr_identity rr_usb_admin_identity;
+static uint8_t rr_usb_admin_flash_uid[RR_USB_ADMIN_FLASH_UID_SIZE];
+
+#if defined(USB_SERIAL_COMMS) && USB_SERIAL_COMMS
+static void rr_usb_admin_legacy_byte(void *context, uint8_t byte)
+{
+    (void)context;
+    usbserial_receive_byte(byte);
+}
+#endif
+
+static void rr_usb_admin_init_for_firmware(
+    const struct rr_identity_store *identity_store)
+{
+    pico_unique_board_id_t board_id;
+    struct rr_usb_admin_config config = {
+        .identity_status = rr_identity_load(identity_store, &rr_usb_admin_identity),
+        .identity = &rr_usb_admin_identity,
+        .flash_uid = rr_usb_admin_flash_uid,
+#if defined(IS_I2C_TARGET) && IS_I2C_TARGET
+        .transport = RR_USB_ADMIN_TRANSPORT_I2C,
+#elif defined(USB_SERIAL_COMMS) && USB_SERIAL_COMMS
+        .transport = RR_USB_ADMIN_TRANSPORT_USB,
+#else
+        .transport = RR_USB_ADMIN_TRANSPORT_UART,
+#endif
+#if defined(GRB_LED_ORDER) && GRB_LED_ORDER
+        .led_order = RR_USB_ADMIN_LED_GRB,
+#else
+        .led_order = RR_USB_ADMIN_LED_RGB,
+#endif
+        .firmware_version = ROADRUNNER_FIRMWARE_VERSION,
+#if defined(USB_SERIAL_COMMS) && USB_SERIAL_COMMS
+        .legacy_byte = rr_usb_admin_legacy_byte,
+#endif
+    };
+
+    pico_get_unique_board_id(&board_id);
+    memcpy(rr_usb_admin_flash_uid, board_id.id, sizeof(rr_usb_admin_flash_uid));
+    rr_usb_admin_init(&config);
+}
 
 //#define IS_I2C_TARGET 1 // uncomment for i2c communication with printer
 //#define USB_SERIAL_COMMS 1 // uncomment for serial over usb communication with printer
@@ -170,6 +215,7 @@ int main() {
     rr_identity_pico_store_init(&identity_store);
     rr_usb_descriptors_init(&identity_store);
     stdio_init_all();
+    rr_usb_admin_init_for_firmware(&identity_store);
 
     neopixel_init();
     sleep_ms(100);
@@ -207,6 +253,8 @@ int main() {
     neopixel_solid(OFF);
 
     while (1) {
+        tud_task();
+        rr_usb_admin_poll();
         update_loop();
 
         if(state.magnet_state != MAGNET_STATE_DETECTED) {
