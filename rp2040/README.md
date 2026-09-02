@@ -44,8 +44,8 @@ identity. The ROM BOOTSEL serial and the flash-derived USB ID are diagnostics,
 not persistent identities.
 
 Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
-UF2 update preserves the identity record; a forthcoming explicit direct-USB
-maintenance command will be the only way to clear the reserved-sector record.
+UF2 update preserves the identity record; the direct-USB `CLEAR_IDENTITY`
+maintenance command is the only way to clear the reserved-sector record.
 
 Maintenance commands are available only over Roadrunner's directly connected
 USB CDC port. They are never forwarded over I2C, UART, or a Klipper sensor
@@ -59,10 +59,12 @@ The maintenance frame is:
 ```
 
 `crc8` is CRC-8/ATM over every preceding byte (polynomial `0x07`, initial
-value `0x00`, no reflection, final XOR `0x00`). `INFO` is opcode `0x01` and
-`REBOOT_BOOTSEL` is opcode `0x02`; responses set bit `0x80` in the opcode.
-The status values are `0x00` OK, `0x01` bad CRC, `0x02` bad length, and `0x03`
-unprovisioned.
+value `0x00`, no reflection, final XOR `0x00`). `INFO` is opcode `0x01`,
+`REBOOT_BOOTSEL` is opcode `0x02`, `PROVISION_UUID` is opcode `0x03`, and
+`CLEAR_IDENTITY` is opcode `0x04`; responses set bit `0x80` in the opcode.
+The status values are `0x00` OK, `0x01` bad CRC, `0x02` bad length, `0x03`
+unprovisioned, `0x04` already provisioned, `0x05` identity conflict, `0x06`
+identity-store I/O error, and `0x07` confirmation required.
 
 An `INFO` request has an empty payload. Its response payload is exactly:
 
@@ -83,6 +85,15 @@ an empty CDC transmit FIFO, then invokes the RP2040 ROM handoff
 `reset_usb_boot(0, 0)`. The same physical USB connection
 must then enumerate as the `RPI-RP2` mass-storage device. Copy the matching
 UF2 and reconnect to query `INFO` again.
+
+`PROVISION_UUID` has a 16-byte UUID payload. It writes the record only when
+the identity store is erased, then returns `OK`, a serial length, and the
+new `RR-<26 base32 UUID>` serial. `CLEAR_IDENTITY` has the four-byte ASCII
+payload `RRCL`; any other four-byte payload returns `confirmation required`
+without changing the store. Successful provision and clear responses are
+flushed and transmitted completely before the application resets. On restart,
+the USB descriptor reloads the stored identity and presents the same newly
+provisioned serial (or the unprovisioned fallback after a clear).
 
 If the maintenance command is unavailable, use the manual fallback: hold
 `BOOT`, press and release `RESET`, release `BOOT` after one second, then copy

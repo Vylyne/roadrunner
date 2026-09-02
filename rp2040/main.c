@@ -11,6 +11,7 @@
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
+#include "hardware/watchdog.h"
 #include "pico/unique_id.h"
 #include "tusb.h"
 
@@ -36,6 +37,15 @@ static void rr_usb_admin_legacy_byte(void *context, uint8_t byte)
 }
 #endif
 
+static void rr_usb_admin_reboot_application(void *context)
+{
+    (void)context;
+    watchdog_reboot(0, 0, 0);
+    while (true) {
+        tight_loop_contents();
+    }
+}
+
 static void rr_usb_admin_init_for_firmware(
     const struct rr_identity_store *identity_store)
 {
@@ -43,6 +53,7 @@ static void rr_usb_admin_init_for_firmware(
     struct rr_usb_admin_config config = {
         .identity_status = rr_identity_load(identity_store, &rr_usb_admin_identity),
         .identity = &rr_usb_admin_identity,
+        .identity_store = identity_store,
         .flash_uid = rr_usb_admin_flash_uid,
 #if defined(IS_I2C_TARGET) && IS_I2C_TARGET
         .transport = RR_USB_ADMIN_TRANSPORT_I2C,
@@ -57,6 +68,7 @@ static void rr_usb_admin_init_for_firmware(
         .led_order = RR_USB_ADMIN_LED_RGB,
 #endif
         .firmware_version = ROADRUNNER_FIRMWARE_VERSION,
+        .reboot_application = rr_usb_admin_reboot_application,
 #if defined(USB_SERIAL_COMMS) && USB_SERIAL_COMMS
         .legacy_byte = rr_usb_admin_legacy_byte,
 #endif

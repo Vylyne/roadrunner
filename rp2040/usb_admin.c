@@ -10,13 +10,7 @@
 enum {
     RR_USB_ADMIN_SYNC = 0x52,
     RR_USB_ADMIN_VERSION = 0x01,
-    RR_USB_ADMIN_INFO = 0x01,
-    RR_USB_ADMIN_REBOOT_BOOTSEL = 0x02,
     RR_USB_ADMIN_RESPONSE = 0x80,
-    RR_USB_ADMIN_OK = 0x00,
-    RR_USB_ADMIN_BAD_CRC = 0x01,
-    RR_USB_ADMIN_BAD_LENGTH = 0x02,
-    RR_USB_ADMIN_UNPROVISIONED = 0x03,
     RR_USB_ADMIN_MAX_PAYLOAD = 64,
     RR_USB_ADMIN_MAX_RESPONSE_PAYLOAD = 96,
     RR_USB_ADMIN_MAX_VERSION_LENGTH = 32,
@@ -129,6 +123,12 @@ static void rr_usb_admin_reboot_bootsel(void) {
 #endif
 }
 
+static void rr_usb_admin_reboot_application(void) {
+    if (rr_usb_admin_config.reboot_application != NULL) {
+        rr_usb_admin_config.reboot_application(rr_usb_admin_config.context);
+    }
+}
+
 static void rr_usb_admin_send_response(uint8_t opcode, const uint8_t *payload,
                                        size_t payload_length) {
     uint8_t response[5u + RR_USB_ADMIN_MAX_RESPONSE_PAYLOAD + 1u];
@@ -151,6 +151,36 @@ static void rr_usb_admin_send_response(uint8_t opcode, const uint8_t *payload,
 
 static void rr_usb_admin_send_status(uint8_t opcode, uint8_t status) {
     rr_usb_admin_send_response(opcode, &status, 1u);
+}
+
+static uint8_t rr_usb_admin_identity_status(rr_identity_status_t status) {
+    switch (status) {
+    case RR_IDENTITY_OK:
+        return RR_USB_ADMIN_OK;
+    case RR_IDENTITY_ALREADY_PROVISIONED:
+        return RR_USB_ADMIN_ALREADY_PROVISIONED;
+    case RR_IDENTITY_CONFLICT:
+        return RR_USB_ADMIN_IDENTITY_CONFLICT;
+    case RR_IDENTITY_IO_ERROR:
+    case RR_IDENTITY_NONE:
+    default:
+        return RR_USB_ADMIN_IO_ERROR;
+    }
+}
+
+static void rr_usb_admin_acknowledge_before_application_reboot(
+    uint8_t opcode, const uint8_t *payload, size_t payload_length) {
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+    rr_usb_admin_tx_complete = false;
+#endif
+    rr_usb_admin_send_response(opcode, payload, payload_length);
+    rr_usb_admin_flush();
+    while (!rr_usb_admin_transmit_complete()) {
+#if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
+        tud_task();
+#endif
+    }
+    rr_usb_admin_reboot_application();
 }
 
 static void rr_usb_admin_make_serial(char serial[35]) {
@@ -207,6 +237,46 @@ static void rr_usb_admin_send_info(void) {
     }
     length += RR_USB_ADMIN_FLASH_UID_SIZE;
     rr_usb_admin_send_response(RR_USB_ADMIN_INFO, payload, length);
+}
+
+static void rr_usb_admin_provision_identity(const uint8_t *uuid) {
+    struct rr_identity identity;
+    uint8_t payload[2u + RR_IDENTITY_SERIAL_LENGTH];
+    char serial[RR_IDENTITY_SERIAL_LENGTH + 1];
+    rr_identity_status_t status = rr_identity_provision(
+        rr_usb_admin_config.identity_store, uuid);
+
+    if (status != RR_IDENTITY_OK) {
+        rr_usb_admin_send_status(RR_USB_ADMIN_PROVISION_UUID,
+                                 rr_usb_admin_identity_status(status));
+        return;
+    }
+    status = rr_identity_load(rr_usb_admin_config.identity_store, &identity);
+    if (status != RR_IDENTITY_OK) {
+        rr_usb_admin_send_status(RR_USB_ADMIN_PROVISION_UUID,
+                                 rr_usb_admin_identity_status(status));
+        return;
+    }
+    rr_identity_serial(identity.uuid, serial);
+    payload[0] = RR_USB_ADMIN_OK;
+    payload[1] = RR_IDENTITY_SERIAL_LENGTH;
+    memcpy(payload + 2u, serial, RR_IDENTITY_SERIAL_LENGTH);
+    rr_usb_admin_acknowledge_before_application_reboot(
+        RR_USB_ADMIN_PROVISION_UUID, payload, sizeof(payload));
+}
+
+static void rr_usb_admin_clear_identity(void) {
+    uint8_t payload = RR_USB_ADMIN_OK;
+    rr_identity_status_t status = rr_identity_clear(
+        rr_usb_admin_config.identity_store);
+
+    if (status != RR_IDENTITY_OK) {
+        rr_usb_admin_send_status(RR_USB_ADMIN_CLEAR_IDENTITY,
+                                 rr_usb_admin_identity_status(status));
+        return;
+    }
+    rr_usb_admin_acknowledge_before_application_reboot(
+        RR_USB_ADMIN_CLEAR_IDENTITY, &payload, 1u);
 }
 
 static void rr_usb_admin_forward_frame(void) {
@@ -310,6 +380,21 @@ void rr_usb_admin_receive(uint8_t byte) {
 #endif
                 }
                 rr_usb_admin_reboot_bootsel();
+            }
+        } else if (opcode == RR_USB_ADMIN_PROVISION_UUID) {
+            if (rr_usb_admin_expected_length != RR_IDENTITY_UUID_SIZE) {
+                rr_usb_admin_send_status(opcode, RR_USB_ADMIN_BAD_LENGTH);
+            } else {
+                rr_usb_admin_provision_identity(rr_usb_admin_frame + 5u);
+            }
+        } else if (opcode == RR_USB_ADMIN_CLEAR_IDENTITY) {
+            if (rr_usb_admin_expected_length != 4u) {
+                rr_usb_admin_send_status(opcode, RR_USB_ADMIN_BAD_LENGTH);
+            } else if (memcmp(rr_usb_admin_frame + 5u, "RRCL", 4u) != 0) {
+                rr_usb_admin_send_status(opcode,
+                                         RR_USB_ADMIN_CONFIRMATION_REQUIRED);
+            } else {
+                rr_usb_admin_clear_identity();
             }
         } else {
             rr_usb_admin_send_status(opcode, RR_USB_ADMIN_BAD_LENGTH);

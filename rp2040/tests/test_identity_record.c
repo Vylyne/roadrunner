@@ -16,12 +16,25 @@ enum {
 
 struct in_memory_store {
     uint8_t sector[ROADRUNNER_IDENTITY_SECTOR_SIZE];
+    size_t read_count;
+    size_t fail_read_at;
+    bool fail_erase;
 };
+
+static void initialize_in_memory_store(struct in_memory_store *memory) {
+    memset(memory, 0, sizeof(*memory));
+    memset(memory->sector, 0xff, sizeof(memory->sector));
+}
 
 static bool in_memory_read(void *context, uint32_t offset,
                            uint8_t *data, size_t length) {
     struct in_memory_store *store = context;
 
+    ++store->read_count;
+    if (store->fail_read_at != 0u
+        && store->read_count == store->fail_read_at) {
+        return false;
+    }
     if (offset > sizeof(store->sector)
         || length > sizeof(store->sector) - offset) {
         return false;
@@ -33,6 +46,9 @@ static bool in_memory_read(void *context, uint32_t offset,
 static bool in_memory_erase(void *context) {
     struct in_memory_store *store = context;
 
+    if (store->fail_erase) {
+        return false;
+    }
     memset(store->sector, 0xff, sizeof(store->sector));
     return true;
 }
@@ -134,6 +150,189 @@ static void usb_admin_test_reboot_bootsel(void *context) {
 
     io->rebooted = true;
     io->events[io->event_length++] = 'R';
+}
+
+static uint8_t test_crc8(const uint8_t *data, size_t length) {
+    uint8_t crc = 0;
+
+    for (size_t index = 0; index < length; ++index) {
+        crc ^= data[index];
+        for (unsigned int bit = 0; bit < 8u; ++bit) {
+            crc = (uint8_t)((crc << 1u)
+                            ^ ((crc & 0x80u) != 0u ? 0x07u : 0u));
+        }
+    }
+    return crc;
+}
+
+static void usb_admin_test_send_frame(uint8_t opcode, const uint8_t *payload,
+                                      size_t payload_length) {
+    uint8_t frame[5u + 64u + 1u] = {0x52, 0x52, 0x01, opcode,
+                                     (uint8_t)payload_length};
+
+    assert(payload_length <= 64u);
+    if (payload_length != 0u) {
+        memcpy(frame + 5u, payload, payload_length);
+    }
+    frame[5u + payload_length] = test_crc8(frame, 5u + payload_length);
+    for (size_t index = 0; index < 6u + payload_length; ++index) {
+        rr_usb_admin_receive(frame[index]);
+    }
+}
+
+static struct rr_usb_admin_config usb_admin_test_config(
+    struct usb_admin_test_io *io, const struct rr_identity_store *store) {
+    return (struct rr_usb_admin_config){
+        .identity_store = store,
+        .context = io,
+        .write = usb_admin_test_write,
+        .flush = usb_admin_test_flush,
+        .transmit_complete = usb_admin_test_transmit_complete,
+        .reboot_application = usb_admin_test_reboot_bootsel,
+    };
+}
+
+static void test_usb_admin_provisions_identity_before_application_reboot(void) {
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
+    char serial[RR_IDENTITY_SERIAL_LENGTH + 1];
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct rr_identity identity;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    uuid[RR_IDENTITY_UUID_SIZE - 1u] = 0x34;
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    config = usb_admin_test_config(&io, &store);
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_PROVISION_UUID, uuid, sizeof(uuid));
+
+    rr_identity_serial(uuid, serial);
+    assert(io.response_length == 8u + RR_IDENTITY_SERIAL_LENGTH);
+    assert(memcmp(io.response, "RR\x01\x83", 4u) == 0);
+    assert(io.response[4] == 2u + RR_IDENTITY_SERIAL_LENGTH);
+    assert(io.response[5] == 0x00u);
+    assert(io.response[6] == RR_IDENTITY_SERIAL_LENGTH);
+    assert(memcmp(io.response + 7u, serial, RR_IDENTITY_SERIAL_LENGTH) == 0);
+    assert(io.rebooted);
+    assert(io.event_length == 4u);
+    assert(memcmp(io.events, "WFTR", io.event_length) == 0);
+    assert(rr_identity_load(&store, &identity) == RR_IDENTITY_OK);
+    assert(memcmp(identity.uuid, uuid, sizeof(uuid)) == 0);
+}
+
+static void test_usb_admin_rejects_second_provision(void) {
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    assert(rr_identity_provision(&store, uuid) == RR_IDENTITY_OK);
+    config = usb_admin_test_config(&io, &store);
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_PROVISION_UUID, uuid, sizeof(uuid));
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x83u);
+    assert(io.response[5] == RR_USB_ADMIN_ALREADY_PROVISIONED);
+    assert(!io.rebooted);
+}
+
+static void test_usb_admin_rejects_conflicting_provision(void) {
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
+    uint8_t conflicting_uuid[RR_IDENTITY_UUID_SIZE] = {0x34};
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    make_valid_record(memory.sector, uuid);
+    make_valid_record(memory.sector + ROADRUNNER_IDENTITY_RECORD_SIZE,
+                      conflicting_uuid);
+    store = make_in_memory_store(&memory);
+    config = usb_admin_test_config(&io, &store);
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_PROVISION_UUID, uuid, sizeof(uuid));
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x83u);
+    assert(io.response[5] == RR_USB_ADMIN_IDENTITY_CONFLICT);
+    assert(!io.rebooted);
+}
+
+static void test_usb_admin_rejects_short_provision_payload(void) {
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0};
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = usb_admin_test_config(&io, NULL);
+
+    rr_usb_admin_init(&config);
+    usb_admin_test_send_frame(RR_USB_ADMIN_PROVISION_UUID, uuid, 15u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x83u);
+    assert(io.response[5] == 0x02u);
+    assert(!io.rebooted);
+}
+
+static void test_usb_admin_clears_identity_after_confirmation(void) {
+    static const uint8_t confirmation[] = "RRCL";
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct rr_identity identity;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    assert(rr_identity_provision(&store, uuid) == RR_IDENTITY_OK);
+    config = usb_admin_test_config(&io, &store);
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
+                              sizeof(confirmation) - 1u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x84u);
+    assert(io.response[5] == 0x00u);
+    assert(io.rebooted);
+    assert(io.event_length == 4u);
+    assert(memcmp(io.events, "WFTR", io.event_length) == 0);
+    assert(rr_identity_load(&store, &identity) == RR_IDENTITY_NONE);
+}
+
+static void test_usb_admin_requires_clear_confirmation(void) {
+    static const uint8_t confirmation[] = "NOPE";
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
+    uint8_t before[ROADRUNNER_IDENTITY_SECTOR_SIZE];
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    assert(rr_identity_provision(&store, uuid) == RR_IDENTITY_OK);
+    memcpy(before, memory.sector, sizeof(before));
+    config = usb_admin_test_config(&io, &store);
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
+                              sizeof(confirmation) - 1u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x84u);
+    assert(io.response[5] == RR_USB_ADMIN_CONFIRMATION_REQUIRED);
+    assert(!io.rebooted);
+    assert(memcmp(memory.sector, before, sizeof(before)) == 0);
 }
 
 static void test_usb_admin_info_frame(void) {
@@ -280,9 +479,9 @@ int main(void) {
     assert(ROADRUNNER_APPLICATION_FLASH_SIZE == 0x1FF000u);
 
     memset(erased, 0xff, sizeof(erased));
-    memset(&blank_memory, 0xff, sizeof(blank_memory));
-    memset(&valid_memory, 0xff, sizeof(valid_memory));
-    memset(&conflict_memory, 0xff, sizeof(conflict_memory));
+    initialize_in_memory_store(&blank_memory);
+    initialize_in_memory_store(&valid_memory);
+    initialize_in_memory_store(&conflict_memory);
     different_uuid[15] = 1;
     provisioned_uuid[0] = 0x12;
     provisioned_uuid[15] = 0x34;
@@ -331,6 +530,25 @@ int main(void) {
     assert(rr_identity_clear(&valid_store) == RR_IDENTITY_OK);
     assert(rr_identity_load(&valid_store, &identity) == RR_IDENTITY_NONE);
 
+    make_valid_record(valid_memory.sector, provisioned_uuid);
+    make_valid_record(valid_memory.sector + ROADRUNNER_IDENTITY_RECORD_SIZE,
+                      provisioned_uuid);
+    memcpy(before, valid_memory.sector, sizeof(before));
+    valid_memory.fail_erase = true;
+    assert(rr_identity_clear(&valid_store) == RR_IDENTITY_IO_ERROR);
+    assert(memcmp(valid_memory.sector, before, sizeof(before)) == 0);
+    valid_memory.fail_erase = false;
+
+    valid_memory.read_count = 0;
+    valid_memory.fail_read_at = 1u;
+    assert(rr_identity_clear(&valid_store) == RR_IDENTITY_IO_ERROR);
+    valid_memory.fail_read_at = 0u;
+
+    valid_memory.read_count = 0;
+    valid_memory.fail_read_at = 3u;
+    assert(rr_identity_clear(&valid_store) == RR_IDENTITY_IO_ERROR);
+    valid_memory.fail_read_at = 0u;
+
     make_valid_record(conflict_memory.sector, provisioned_uuid);
     make_valid_record(conflict_memory.sector + ROADRUNNER_IDENTITY_RECORD_SIZE,
                       conflicting_uuid);
@@ -357,5 +575,11 @@ int main(void) {
     test_usb_admin_preserves_legacy_register_traffic();
     test_usb_admin_rejects_bad_crc();
     test_usb_admin_acknowledges_before_bootsel_reboot();
+    test_usb_admin_provisions_identity_before_application_reboot();
+    test_usb_admin_rejects_second_provision();
+    test_usb_admin_rejects_conflicting_provision();
+    test_usb_admin_rejects_short_provision_payload();
+    test_usb_admin_clears_identity_after_confirmation();
+    test_usb_admin_requires_clear_confirmation();
     return 0;
 }
