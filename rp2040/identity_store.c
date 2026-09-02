@@ -62,6 +62,26 @@ rr_identity_status_t rr_identity_load(const struct rr_identity_store *store,
     return rr_identity_select(first, second, identity);
 }
 
+rr_identity_status_t rr_identity_clear(const struct rr_identity_store *store) {
+    uint8_t first[ROADRUNNER_IDENTITY_RECORD_SIZE];
+    uint8_t second[ROADRUNNER_IDENTITY_RECORD_SIZE];
+    rr_identity_status_t status;
+
+    if (!rr_identity_store_read_slots(store, first, second)) {
+        return RR_IDENTITY_IO_ERROR;
+    }
+    status = rr_identity_select(first, second, NULL);
+    if (status == RR_IDENTITY_CONFLICT) {
+        return RR_IDENTITY_CONFLICT;
+    }
+    if (store->erase == NULL || !store->erase(store->context)
+        || !rr_identity_store_read_slots(store, first, second)) {
+        return RR_IDENTITY_IO_ERROR;
+    }
+    return rr_identity_select(first, second, NULL) == RR_IDENTITY_NONE
+        ? RR_IDENTITY_OK : RR_IDENTITY_IO_ERROR;
+}
+
 rr_identity_status_t rr_identity_provision(
     const struct rr_identity_store *store,
     const uint8_t uuid[RR_IDENTITY_UUID_SIZE]) {

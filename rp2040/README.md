@@ -43,6 +43,10 @@ Each image reserves the final flash sector for a persistent Roadrunner device
 identity. The ROM BOOTSEL serial and the flash-derived USB ID are diagnostics,
 not persistent identities.
 
+Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
+UF2 update preserves the identity record; a forthcoming explicit direct-USB
+maintenance command will be the only way to clear the reserved-sector record.
+
 Maintenance commands are available only over Roadrunner's directly connected
 USB CDC port. They are never forwarded over I2C, UART, or a Klipper sensor
 transport. The legacy USB sensor-register stream beginning with `0xf5`

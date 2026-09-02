@@ -162,14 +162,14 @@ static void rr_usb_admin_make_serial(char serial[35]) {
         return;
     }
 
-    memcpy(serial, "RR1-UNPROVISIONED-", 18u);
+    memcpy(serial, "RR-UNPROVISIONED-", 17u);
     for (size_t index = 0; index < RR_USB_ADMIN_FLASH_UID_SIZE; ++index) {
         uint8_t byte = rr_usb_admin_config.flash_uid == NULL ? 0u
             : rr_usb_admin_config.flash_uid[index];
-        serial[18u + index * 2u] = hexadecimal[byte >> 4u];
-        serial[19u + index * 2u] = hexadecimal[byte & 0x0fu];
+        serial[17u + index * 2u] = hexadecimal[byte >> 4u];
+        serial[18u + index * 2u] = hexadecimal[byte & 0x0fu];
     }
-    serial[34] = '\0';
+    serial[17u + RR_USB_ADMIN_FLASH_UID_SIZE * 2u] = '\0';
 }
 
 static void rr_usb_admin_send_info(void) {

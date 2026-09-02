@@ -17,6 +17,7 @@ struct rr_identity_store {
 
 rr_identity_status_t rr_identity_load(const struct rr_identity_store *store,
                                       struct rr_identity *identity);
+rr_identity_status_t rr_identity_clear(const struct rr_identity_store *store);
 rr_identity_status_t rr_identity_provision(
     const struct rr_identity_store *store,
     const uint8_t uuid[RR_IDENTITY_UUID_SIZE]);

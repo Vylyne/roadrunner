@@ -139,17 +139,17 @@ static void usb_admin_test_reboot_bootsel(void *context) {
 static void test_usb_admin_info_frame(void) {
     static const uint8_t request[] = {0x52, 0x52, 0x01, 0x01, 0x00, 0x90};
     static const uint8_t expected_response[] = {
-        0x52, 0x52, 0x01, 0x81, 0x3d,
+        0x52, 0x52, 0x01, 0x81, 0x3c,
         0x00, 0x01, 0x03, 0x02, 0x0d,
         0x72, 0x6f, 0x61, 0x64, 0x72, 0x75, 0x6e, 0x6e, 0x65, 0x72,
         0x2d, 0x76, 0x31,
         0x03, 0x64, 0x65, 0x76,
-        0x1e, 0x52, 0x52, 0x31, 0x2d,
+        0x1d, 0x52, 0x52, 0x2d,
         0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
         0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
         0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x91,
+        0xab,
     };
     struct rr_identity identity = {0};
     static const uint8_t flash_uid[RR_USB_ADMIN_FLASH_UID_SIZE] = {
@@ -304,7 +304,7 @@ int main(void) {
     assert(rr_identity_select(valid, different, &identity) == RR_IDENTITY_CONFLICT);
 
     rr_identity_serial(zero_uuid, serial);
-    assert(strcmp(serial, "RR1-00000000000000000000000000") == 0);
+    assert(strcmp(serial, "RR-00000000000000000000000000") == 0);
     assert(serial[RR_IDENTITY_SERIAL_LENGTH] == '\0');
     for (size_t index = 0; index < RR_IDENTITY_SERIAL_LENGTH; ++index) {
         assert(serial[index] >= '!' && serial[index] <= '~');
@@ -328,6 +328,8 @@ int main(void) {
     assert(rr_identity_provision(&valid_store, provisioned_uuid)
            == RR_IDENTITY_ALREADY_PROVISIONED);
     assert(memcmp(valid_memory.sector, before, sizeof(before)) == 0);
+    assert(rr_identity_clear(&valid_store) == RR_IDENTITY_OK);
+    assert(rr_identity_load(&valid_store, &identity) == RR_IDENTITY_NONE);
 
     make_valid_record(conflict_memory.sector, provisioned_uuid);
     make_valid_record(conflict_memory.sector + ROADRUNNER_IDENTITY_RECORD_SIZE,
@@ -336,6 +338,7 @@ int main(void) {
     assert(rr_identity_load(&conflict_store, &identity) == RR_IDENTITY_CONFLICT);
     assert(rr_identity_provision(&conflict_store, provisioned_uuid)
            == RR_IDENTITY_CONFLICT);
+    assert(rr_identity_clear(&conflict_store) == RR_IDENTITY_CONFLICT);
     assert(memcmp(conflict_memory.sector, before, sizeof(before)) == 0);
 
     descriptor_identity.uuid[0] = 0;
@@ -344,12 +347,12 @@ int main(void) {
     assert(strcmp(RR_USB_MANUFACTURER, "Vylyne") == 0);
     assert(strcmp(RR_USB_PRODUCT, "Roadrunner") == 0);
     assert(strcmp(descriptor_strings.serial,
-                  "RR1-00000000000000000000000000") == 0);
+                  "RR-00000000000000000000000000") == 0);
 
     rr_usb_descriptor_strings_build(&descriptor_strings, RR_IDENTITY_NONE,
                                     NULL, flash_uid);
     assert(strcmp(descriptor_strings.serial,
-                  "RR1-UNPROVISIONED-0123456789ABCDEF") == 0);
+                  "RR-UNPROVISIONED-0123456789ABCDEF") == 0);
     test_usb_admin_info_frame();
     test_usb_admin_preserves_legacy_register_traffic();
     test_usb_admin_rejects_bad_crc();

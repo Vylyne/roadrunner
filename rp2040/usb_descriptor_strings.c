@@ -17,10 +17,10 @@ void rr_usb_descriptor_strings_build(
         return;
     }
 
-    memcpy(strings->serial, "RR1-UNPROVISIONED-", 18u);
+    memcpy(strings->serial, "RR-UNPROVISIONED-", 17u);
     for (unsigned int index = 0; index < RR_USB_FLASH_UID_SIZE; ++index) {
-        strings->serial[18u + index * 2u] = hex[flash_uid[index] >> 4u];
-        strings->serial[19u + index * 2u] = hex[flash_uid[index] & 0x0fu];
+        strings->serial[17u + index * 2u] = hex[flash_uid[index] >> 4u];
+        strings->serial[18u + index * 2u] = hex[flash_uid[index] & 0x0fu];
     }
-    strings->serial[RR_USB_SERIAL_MAX_LENGTH] = '\0';
+    strings->serial[17u + RR_USB_FLASH_UID_SIZE * 2u] = '\0';
 }

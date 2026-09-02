@@ -90,7 +90,7 @@ void rr_identity_serial(const uint8_t uuid[RR_IDENTITY_UUID_SIZE],
                         char serial[RR_IDENTITY_SERIAL_LENGTH + 1]) {
     static const char alphabet[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-    memcpy(serial, "RR1-", 4);
+    memcpy(serial, "RR-", 3);
     for (unsigned int character = 0; character < 26; ++character) {
         unsigned int value = 0;
 
@@ -103,7 +103,7 @@ void rr_identity_serial(const uint8_t uuid[RR_IDENTITY_UUID_SIZE],
                           >> (7u - ((unsigned int)uuid_bit % 8u))) & 1u;
             }
         }
-        serial[4u + character] = alphabet[value];
+        serial[3u + character] = alphabet[value];
     }
     serial[RR_IDENTITY_SERIAL_LENGTH] = '\0';
 }
