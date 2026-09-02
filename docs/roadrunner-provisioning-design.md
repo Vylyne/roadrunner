@@ -44,10 +44,13 @@ REBOOT_BOOTSEL (`0x02`) keep their current meaning. New requests are:
 | `0x03` | `PROVISION_UUID` | exactly 16 raw UUID bytes | status, serial length, rendered serial | writes a blank identity sector, then application-reboots |
 | `0x04` | `CLEAR_IDENTITY` | ASCII `RRCL` | status | erases the identity sector, then application-reboots |
 
-Responses set opcode bit `0x80`. A successful provisioning response is sent
-and its transmit completion is observed before reset. `CLEAR_IDENTITY` uses a
-fixed four-byte confirmation to prevent an empty or malformed request from
-clearing identity accidentally; it is not an authentication mechanism.
+Responses set opcode bit `0x80`. Successful provisioning and clear responses
+are sent and their transmit completion is observed before an application reset
+and CDC re-enumeration. `REBOOT_BOOTSEL` instead enters the ROM BOOTSEL
+handoff and re-enumerates as `RPI-RP2`; INFO and all error/refusal responses do
+not reset. `CLEAR_IDENTITY` uses a fixed four-byte confirmation to prevent an
+empty or malformed request from clearing identity accidentally; it is not an
+authentication mechanism.
 
 New status values are:
 
@@ -98,6 +101,9 @@ default behavior; it may be introduced later as an explicit setting.
   flash region inaccessible.
 
 ## Verification
+
+The exact byte-level contract is maintained in
+[`roadrunner-usb-admin-protocol.md`](roadrunner-usb-admin-protocol.md).
 
 Firmware host tests cover valid and invalid provision/clear frames, every
 store result, exact response bytes, identity serial rendering, and the

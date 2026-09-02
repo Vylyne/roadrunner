@@ -45,7 +45,9 @@ not persistent identities.
 
 Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
 UF2 update preserves the identity record; the direct-USB `CLEAR_IDENTITY`
-maintenance command is the only way to clear the reserved-sector record.
+maintenance command is the only way to clear the reserved-sector record. See
+[`../docs/roadrunner-usb-admin-protocol.md`](../docs/roadrunner-usb-admin-protocol.md)
+for the complete byte-level contract and updater rules.
 
 Maintenance commands are available only over Roadrunner's directly connected
 USB CDC port. They are never forwarded over I2C, UART, or a Klipper sensor
@@ -91,7 +93,9 @@ the identity store is erased, then returns `OK`, a serial length, and the
 new `RR-<26 base32 UUID>` serial. `CLEAR_IDENTITY` has the four-byte ASCII
 payload `RRCL`; any other four-byte payload returns `confirmation required`
 without changing the store. Successful provision and clear responses are
-flushed and transmitted completely before the application resets. On restart,
+flushed and transmitted completely before the application resets and the CDC
+device re-enumerates. INFO and all error/refusal responses do not reset. On
+restart,
 the USB descriptor reloads the stored identity and presents the same newly
 provisioned serial (or the unprovisioned fallback after a clear).
 
@@ -107,4 +111,6 @@ USB-serial, I2C, and UART images in both RGB and GRB variants. Every image
 returned the complete ACK `52 52 01 82 01 00 5a` before the board re-enumerated
 as `RPI-RP2`. The USB-serial GRB image also returned a complete legacy
 `0xf5 0x10` register-read frame, confirming the maintenance parser preserves
-the sensor protocol.
+the sensor protocol. Provisioning, clear, UF2-retention, refusal, and bad
+confirmation still require the dedicated bench matrix in the protocol
+reference; those results are not yet recorded.
