@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -183,13 +182,11 @@ void update_loop()
         state.filament_present = ir_sensor_value();
 
         if(!update_magnet_state()) {
-            printf("Update magnet state failed...\n");
             // state.health = HEALTH_AS5600_READ_FAILED;
             return;
         }
 
         if(!update_magnet_angle()) {
-            printf("Update angle failed...\n");
             // state.health = HEALTH_AS5600_READ_FAILED;
             return;
         }
@@ -233,8 +230,6 @@ int main() {
     sleep_ms(100);
     neopixel_solid(RED);
 
-    printf("Starting...\n");
-
     // state.health = HEALTH_UNKNOWN;
     state.magnet_state = MAGNET_STATE_UNKNOWN;
     state.filament_present = false;
@@ -255,13 +250,6 @@ int main() {
 
     sleep_ms(1000);
 
-    uint16_t min, max, mang;
-    as5600_get_zero_position(&min);
-    as5600_get_max_position(&max);
-    as5600_get_max_angle(&mang);
-    printf("AS5600 min position: %u max position: %u, max angle: %u\n", min, max, mang);
-
-    printf("Entering main loop...\n");
     neopixel_solid(OFF);
 
     while (1) {

@@ -14,3 +14,10 @@ add_executable(roadrunner_identity_tests
 target_include_directories(roadrunner_identity_tests PRIVATE ..)
 
 add_test(NAME identity_record COMMAND roadrunner_identity_tests)
+
+add_test(
+    NAME protocol_only_cdc
+    COMMAND ${CMAKE_COMMAND}
+        -DROADRUNNER_MAIN=${CMAKE_CURRENT_LIST_DIR}/../main.c
+        -P ${CMAKE_CURRENT_LIST_DIR}/check_protocol_only_stdio.cmake
+)
