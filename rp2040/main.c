@@ -18,6 +18,9 @@
 #include "tmcuart.h"
 #include "i2c_target.h"
 #include "usbserial.h"
+#include "identity_store.h"
+
+void rr_usb_descriptors_init(const struct rr_identity_store *store);
 
 //#define IS_I2C_TARGET 1 // uncomment for i2c communication with printer
 //#define USB_SERIAL_COMMS 1 // uncomment for serial over usb communication with printer
@@ -162,6 +165,10 @@ void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
 }
 
 int main() {
+    struct rr_identity_store identity_store;
+
+    rr_identity_pico_store_init(&identity_store);
+    rr_usb_descriptors_init(&identity_store);
     stdio_init_all();
 
     neopixel_init();

@@ -1,5 +1,6 @@
 #include "identity_record.h"
 #include "identity_store.h"
+#include "usb_descriptor_strings.h"
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
@@ -106,6 +107,11 @@ int main(void) {
     struct rr_identity_store blank_store;
     struct rr_identity_store valid_store;
     struct rr_identity_store conflict_store;
+    struct rr_identity descriptor_identity = {0};
+    struct rr_usb_descriptor_strings descriptor_strings;
+    uint8_t flash_uid[RR_USB_FLASH_UID_SIZE] = {
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    };
 
     assert(ROADRUNNER_IDENTITY_FLASH_OFFSET == 0x1FF000u);
     assert(ROADRUNNER_IDENTITY_SECTOR_SIZE == 0x1000u);
@@ -169,5 +175,18 @@ int main(void) {
     assert(rr_identity_provision(&conflict_store, provisioned_uuid)
            == RR_IDENTITY_CONFLICT);
     assert(memcmp(conflict_memory.sector, before, sizeof(before)) == 0);
+
+    descriptor_identity.uuid[0] = 0;
+    rr_usb_descriptor_strings_build(&descriptor_strings, RR_IDENTITY_OK,
+                                    &descriptor_identity, flash_uid);
+    assert(strcmp(RR_USB_MANUFACTURER, "Vylyne") == 0);
+    assert(strcmp(RR_USB_PRODUCT, "Roadrunner") == 0);
+    assert(strcmp(descriptor_strings.serial,
+                  "RR1-00000000000000000000000000") == 0);
+
+    rr_usb_descriptor_strings_build(&descriptor_strings, RR_IDENTITY_NONE,
+                                    NULL, flash_uid);
+    assert(strcmp(descriptor_strings.serial,
+                  "RR1-UNPROVISIONED-0123456789ABCDEF") == 0);
     return 0;
 }
