@@ -111,6 +111,14 @@ USB-serial, I2C, and UART images in both RGB and GRB variants. Every image
 returned the complete ACK `52 52 01 82 01 00 5a` before the board re-enumerated
 as `RPI-RP2`. The USB-serial GRB image also returned a complete legacy
 `0xf5 0x10` register-read frame, confirming the maintenance parser preserves
-the sensor protocol. Provisioning, clear, UF2-retention, refusal, and bad
-confirmation still require the dedicated bench matrix in the protocol
-reference; those results are not yet recorded.
+the sensor protocol. Provisioning, clear, UF2-retention, and refusal
+behavior were validated against the dedicated bench matrix in the protocol
+reference on a recoverable RP2040-Zero on 2026-09-02: all six RGB/GRB
+transport images reported the correct INFO transport and LED order, retained
+their serial across an ordinary UF2 update, and successfully cleared and
+reprovisioned a new serial; both USB-serial images also returned the legacy
+`F5 10` response; a duplicate `PROVISION_UUID` was rejected with
+`ALREADY_PROVISIONED` on all six images, and a bad clear confirmation was
+rejected with `CONFIRMATION_REQUIRED` without rebooting. See
+[`../docs/roadrunner-usb-admin-protocol.md`](../docs/roadrunner-usb-admin-protocol.md#bench-matrix)
+for the full bench matrix and results.

@@ -21,9 +21,9 @@
 - [x] Persistent provisioned device identities with safe USB diagnostics
 - [x] Direct USB maintenance and ROM BOOTSEL recovery
 
-Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. Ordinary UF2
-updates preserve the identity record; a forthcoming explicit direct-USB
-maintenance command will be the only way to clear it.
+Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
+UF2 update preserves the identity record; the direct-USB `CLEAR_IDENTITY`
+maintenance command is the only way to clear it.
 
 ## TODO
 
