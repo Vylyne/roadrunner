@@ -1,6 +1,7 @@
 # IDE environment
 .vscode/
 *.code-workspace
+.worktrees/
 NOTES.md
 docs/superpowers/
 
