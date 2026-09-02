@@ -120,7 +120,10 @@ The following is the required recoverable-bench validation for provisioning:
 7. Send a bad clear confirmation and confirm `CONFIRMATION_REQUIRED` without reboot.
 8. Verify manual BOOTSEL recovery and repeat a legacy `F5 10` read on USB serial.
 
-Earlier bench work verified BOOTSEL ACKs and a legacy `F5 10` read across the
-RGB/GRB transport images. The provisioning, clear, retention, refusal, and
-bad-confirmation portions of this matrix remain unperformed until a bench
-board is available; they are not represented as passing results here.
+Bench validation completed on a recoverable RP2040-Zero on 2026-09-02. All
+six RGB/GRB transport images reported the correct INFO transport and LED
+order, retained the current serial across the next ordinary UF2 update, and
+successfully cleared and reprovisioned a new serial. Both USB-serial images
+also returned the legacy `F5 10` response. A second `PROVISION_UUID` was
+rejected with `ALREADY_PROVISIONED` on all six images; a bad clear confirmation
+was rejected with `CONFIRMATION_REQUIRED` without rebooting.

@@ -110,10 +110,12 @@ store result, exact response bytes, identity serial rendering, and the
 ACK-to-reset ordering. Firmware builds must link all six RGB/GRB transport
 images.
 
-Bench validation uses only a recoverable RP2040-Zero. It records: initial
-unprovisioned INFO; provisioning and descriptor/INFO transition to `RR-`;
-ordinary UF2 retention; rejection of a second provisioning request; clear and
-transition back to unprovisioned; interrupted record write behavior; and
-manual BOOTSEL recovery. mcu-updater tests cover discovery classification,
-UUID generation, the confirmed physical-path handoff, re-enumeration mismatch
-refusal, and leaving successful devices untracked.
+Bench validation uses only a recoverable RP2040-Zero. The 2026-09-02 run
+covered initial unprovisioned INFO; provisioning and descriptor/INFO transition
+to `RR-`; ordinary UF2 retention; rejection of a second provisioning request;
+clear and reprovisioning; bad-clear rejection without reboot; manual BOOTSEL
+recovery; and legacy USB reads. Interrupted record-write behavior remains
+covered by host tests rather than bench fault injection. mcu-updater tests
+cover discovery classification, UUID generation, the confirmed physical-path
+handoff, re-enumeration mismatch refusal, and leaving successful devices
+untracked.
