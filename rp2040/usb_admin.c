@@ -368,6 +368,11 @@ void rr_usb_admin_receive(uint8_t byte) {
         } else if (opcode == RR_USB_ADMIN_REBOOT_BOOTSEL) {
             if (rr_usb_admin_expected_length != 0u) {
                 rr_usb_admin_send_status(opcode, RR_USB_ADMIN_BAD_LENGTH);
+            } else if (rr_usb_admin_config.identity_status != RR_IDENTITY_OK) {
+                /* There is no reason to reflash a board that cannot be used,
+                 * and refusing keeps this interface read-plus-provision only
+                 * until an identity exists. */
+                rr_usb_admin_send_status(opcode, RR_USB_ADMIN_UNPROVISIONED);
             } else {
 #if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
                 rr_usb_admin_tx_complete = false;
@@ -393,6 +398,13 @@ void rr_usb_admin_receive(uint8_t byte) {
             } else if (memcmp(rr_usb_admin_frame + 5u, "RRCL", 4u) != 0) {
                 rr_usb_admin_send_status(opcode,
                                          RR_USB_ADMIN_CONFIRMATION_REQUIRED);
+            } else if (rr_usb_admin_config.identity_status
+                       == RR_IDENTITY_NONE) {
+                /* Nothing to erase. Deliberately NOT gated on RR_IDENTITY_OK:
+                 * CONFLICT and IO_ERROR are the states a clear exists to
+                 * recover from, so refusing those would lock a broken board
+                 * out of its own repair path. */
+                rr_usb_admin_send_status(opcode, RR_USB_ADMIN_UNPROVISIONED);
             } else {
                 rr_usb_admin_clear_identity();
             }

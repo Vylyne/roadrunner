@@ -295,6 +295,7 @@ static void test_usb_admin_clears_identity_after_confirmation(void) {
     store = make_in_memory_store(&memory);
     assert(rr_identity_provision(&store, uuid) == RR_IDENTITY_OK);
     config = usb_admin_test_config(&io, &store);
+    config.identity_status = RR_IDENTITY_OK;
     rr_usb_admin_init(&config);
 
     usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
@@ -430,6 +431,7 @@ static void test_usb_admin_acknowledges_before_bootsel_reboot(void) {
     };
     struct usb_admin_test_io io = {0};
     struct rr_usb_admin_config config = {
+        .identity_status = RR_IDENTITY_OK,
         .context = &io,
         .write = usb_admin_test_write,
         .flush = usb_admin_test_flush,
@@ -447,6 +449,88 @@ static void test_usb_admin_acknowledges_before_bootsel_reboot(void) {
     assert(io.rebooted);
     assert(io.event_length == 4);
     assert(memcmp(io.events, "WFTR", io.event_length) == 0);
+}
+
+static void test_usb_admin_refuses_bootsel_while_unprovisioned(void) {
+    struct usb_admin_test_io io = {0};
+    /* identity_status defaults to RR_IDENTITY_NONE, exactly what
+     * rr_identity_load() reports for a virgin board. */
+    struct rr_usb_admin_config config = usb_admin_test_config(&io, NULL);
+
+    config.reboot_bootsel = usb_admin_test_reboot_bootsel;
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_REBOOT_BOOTSEL, NULL, 0u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x82u);
+    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
+    assert(!io.rebooted);
+}
+
+static void test_usb_admin_refuses_clear_with_nothing_to_clear(void) {
+    static const uint8_t confirmation[] = "RRCL";
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    config = usb_admin_test_config(&io, &store);
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
+                              sizeof(confirmation) - 1u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x84u);
+    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
+    assert(!io.rebooted);
+}
+
+static void test_usb_admin_allows_clear_to_repair_a_conflict(void) {
+    /* A conflicted board is the case CLEAR_IDENTITY exists for. Gating clear
+     * on RR_IDENTITY_OK would lock it out of its own repair path. */
+    static const uint8_t confirmation[] = "RRCL";
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct rr_identity identity;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    assert(rr_identity_provision(&store, uuid) == RR_IDENTITY_OK);
+    config = usb_admin_test_config(&io, &store);
+    config.identity_status = RR_IDENTITY_CONFLICT;
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
+                              sizeof(confirmation) - 1u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x84u);
+    assert(io.response[5] == 0x00u);
+    assert(rr_identity_load(&store, &identity) == RR_IDENTITY_NONE);
+}
+
+static void test_usb_admin_still_answers_info_while_unprovisioned(void) {
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = usb_admin_test_config(&io, NULL);
+
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_INFO, NULL, 0u);
+
+    /* INFO carries 0x03 as its status *field*, inside a full payload. A
+     * refused opcode carries 0x03 as a one-byte status. Hosts must not
+     * confuse the two, so the difference is pinned here and spelled out in
+     * docs/roadrunner-usb-admin-protocol.md. */
+    assert(io.response[3] == 0x81u);
+    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
+    assert(io.response_length > 7u);
 }
 
 int main(void) {
@@ -581,5 +665,9 @@ int main(void) {
     test_usb_admin_rejects_short_provision_payload();
     test_usb_admin_clears_identity_after_confirmation();
     test_usb_admin_requires_clear_confirmation();
+    test_usb_admin_refuses_bootsel_while_unprovisioned();
+    test_usb_admin_refuses_clear_with_nothing_to_clear();
+    test_usb_admin_allows_clear_to_repair_a_conflict();
+    test_usb_admin_still_answers_info_while_unprovisioned();
     return 0;
 }
