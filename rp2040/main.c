@@ -22,6 +22,7 @@
 #include "usbserial.h"
 #include "identity_store.h"
 #include "usb_admin.h"
+#include "identity_registers.h"
 
 void rr_usb_descriptors_init(const struct rr_identity_store *store);
 
@@ -75,6 +76,19 @@ static void rr_usb_admin_init_for_firmware(
 
     pico_get_unique_board_id(&board_id);
     memcpy(rr_usb_admin_flash_uid, board_id.id, sizeof(rr_usb_admin_flash_uid));
+
+    {
+        struct rr_identity_registers_config register_config = {
+            .identity_status = config.identity_status,
+            .identity = config.identity,
+            .flash_uid = config.flash_uid,
+            .transport = config.transport,
+            .led_order = config.led_order,
+            .firmware_version = config.firmware_version,
+        };
+        rr_identity_registers_init(&register_config);
+    }
+
     rr_usb_admin_init(&config);
 }
 
@@ -203,6 +217,9 @@ void update_loop()
 
 void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
 {
+    if(rr_identity_registers_read(reg, buf, length))
+        return;
+
     if(reg == READ_ALL) {
         MEMCPY_REG_DATA(buf, state, *length);
     // } else if(reg == READ_HEALTH) {

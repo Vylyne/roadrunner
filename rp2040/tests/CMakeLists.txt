@@ -15,11 +15,22 @@ target_include_directories(roadrunner_identity_tests PRIVATE ..)
 
 add_test(NAME identity_record COMMAND roadrunner_identity_tests)
 
+add_executable(roadrunner_identity_register_tests
+    test_identity_registers.c
+    ../identity_registers.c
+    ../identity_record.c
+    ../usb_descriptor_strings.c
+)
+target_include_directories(roadrunner_identity_register_tests PRIVATE ..)
+
+add_test(NAME identity_registers COMMAND roadrunner_identity_register_tests)
+
 set(ROADRUNNER_STDIO_USB_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../main.c
     ${CMAKE_CURRENT_LIST_DIR}/../as5600.c
     ${CMAKE_CURRENT_LIST_DIR}/../i2c_target.c
     ${CMAKE_CURRENT_LIST_DIR}/../identity_record.c
+    ${CMAKE_CURRENT_LIST_DIR}/../identity_registers.c
     ${CMAKE_CURRENT_LIST_DIR}/../identity_store.c
     ${CMAKE_CURRENT_LIST_DIR}/../ir_sensor.c
     ${CMAKE_CURRENT_LIST_DIR}/../neopixel.c
