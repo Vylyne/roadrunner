@@ -217,6 +217,15 @@ void update_loop()
 
 void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
 {
+    /* Zero first: the 0xff memset below runs unconditionally on *length
+     * bytes when locked, so an unknown register with an uninitialised
+     * length would turn into an out-of-bounds write into the caller's
+     * buffer instead of just a bad frame. Every current caller already
+     * zeroes length before calling, so this is a no-op for them - it just
+     * makes the function safe on its own rather than relying on a
+     * precondition that isn't written down anywhere. */
+    *length = 0;
+
     if(rr_identity_registers_read(reg, buf, length))
         return;
 
