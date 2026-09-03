@@ -511,9 +511,14 @@ static void test_usb_admin_refuses_clear_with_nothing_to_clear(void) {
     assert(!io.rebooted);
 }
 
-static void test_usb_admin_allows_clear_to_repair_a_conflict(void) {
-    /* A conflicted board is the case CLEAR_IDENTITY exists for. Gating clear
-     * on RR_IDENTITY_OK would lock it out of its own repair path. */
+static void test_usb_admin_clear_gate_admits_a_non_none_status(void) {
+    /* This exercises the opcode gate only: config.identity_status is set
+     * to RR_IDENTITY_CONFLICT directly, but the store underneath was never
+     * put into a genuine two-slot disagreement, so rr_identity_clear() sees
+     * a clean store and erases it. The gate admits CLEAR_IDENTITY for any
+     * status but RR_IDENTITY_NONE; it does not follow that clear can repair
+     * a real conflict - the store refuses that, proven negatively by the
+     * store-level test around test_identity_record.c:663-671. */
     static const uint8_t confirmation[] = "RRCL";
     uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
     struct in_memory_store memory;
@@ -689,7 +694,7 @@ int main(void) {
     test_usb_admin_requires_clear_confirmation();
     test_usb_admin_allows_bootsel_from_any_identity_state();
     test_usb_admin_refuses_clear_with_nothing_to_clear();
-    test_usb_admin_allows_clear_to_repair_a_conflict();
+    test_usb_admin_clear_gate_admits_a_non_none_status();
     test_usb_admin_still_answers_info_while_unprovisioned();
     return 0;
 }

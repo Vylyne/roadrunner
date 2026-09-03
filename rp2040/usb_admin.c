@@ -395,10 +395,12 @@ void rr_usb_admin_receive(uint8_t byte) {
                                          RR_USB_ADMIN_CONFIRMATION_REQUIRED);
             } else if (rr_usb_admin_config.identity_status
                        == RR_IDENTITY_NONE) {
-                /* Nothing to erase. Deliberately NOT gated on RR_IDENTITY_OK:
-                 * CONFLICT and IO_ERROR are the states a clear exists to
-                 * recover from, so refusing those would lock a broken board
-                 * out of its own repair path. */
+                /* Refused only for RR_IDENTITY_NONE: the one state with
+                 * genuinely nothing to erase. IO_ERROR is admitted because
+                 * it is sometimes recoverable (a verify-stage failure with
+                 * working reads still reaches the erase). CONFLICT is also
+                 * admitted, but the store itself refuses to erase it -
+                 * REBOOT_BOOTSEL is the real recovery path there. */
                 rr_usb_admin_send_status(opcode, RR_USB_ADMIN_UNPROVISIONED);
             } else {
                 rr_usb_admin_clear_identity();
