@@ -38,6 +38,8 @@ bool usbserial_sync()
 
 void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length);
 
+static bool usbserial_waiting_for_register;
+
 static void usbserial_send_response(uint8_t reg)
 {
     uint8_t data[255];
@@ -56,14 +58,16 @@ static void usbserial_send_response(uint8_t reg)
     usbserial_write((uint8_t *)&data, length+3);
 }
 
+void usbserial_receive_byte(uint8_t byte)
+{
+    if (usbserial_waiting_for_register) {
+        usbserial_waiting_for_register = false;
+        usbserial_send_response(byte);
+    } else if (byte == 0xf5) {
+        usbserial_waiting_for_register = true;
+    }
+}
+
 void usbserial_loop()
 {
-    uint8_t reg;
-
-    if (!usbserial_sync())
-        return;
-
-    usbserial_read((uint8_t *)&reg, 1);
-
-    usbserial_send_response(reg);
 }

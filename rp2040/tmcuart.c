@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <string.h>
 
 #include "pico/stdlib.h"
@@ -105,7 +104,10 @@ void tmcuart_loop()
     crc = cmd[3];
 
     if(crc != tmcuart_crc8((uint8_t *)&cmd, 3)) {
-        printf("received addr=%02x reg=%02x crc=%02x (BAD CRC)\n", addr, reg, crc);
+        // Both UART images enable USB CDC stdio for the admin protocol, so
+        // this diagnostic cannot be printf'd without colliding with protocol
+        // frames on the same CDC interface. Silently drop the bad frame.
+        (void)addr;
         return;
     }
 
