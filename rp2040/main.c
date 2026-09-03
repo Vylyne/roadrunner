@@ -293,7 +293,14 @@ int main() {
         rr_usb_admin_poll();
         update_loop();
 
-        if(state.magnet_state != MAGNET_STATE_DETECTED) {
+        if(rr_identity_registers_locked()
+           && rr_identity_led_burst_active((uint32_t)(time_us_64() / 1000u))) {
+            /* Between bursts the diagnostics own the LED completely. Because
+             * PROVISION_UUID resets the board, the absence of amber on the
+             * next boot is the success confirmation - visible with no host,
+             * no tool and no serial console. */
+            neopixel_blink(AMBER, RR_IDENTITY_LED_BLINK_MS);
+        } else if(state.magnet_state != MAGNET_STATE_DETECTED) {
             neopixel_blink(RED, 100);
         } else if(!state.filament_present) {
             neopixel_solid(BLUE);

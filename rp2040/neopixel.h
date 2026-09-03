@@ -27,6 +27,7 @@ static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
 #define GREEN urgb_u32(0, 0xff, 0)
 #define BLUE urgb_u32(0, 0, 0xff)
 #define OFF urgb_u32(0, 0, 0)
+#define AMBER urgb_u32(0xff, 0x60, 0)
 
 void neopixel_init();
 void neopixel_loop();

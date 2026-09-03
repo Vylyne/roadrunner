@@ -156,6 +156,48 @@ static void test_identity_window_readable_while_locked(void) {
     assert(rr_identity_registers_read(RR_REG_FLASH_UID, buf, &length));
 }
 
+static void test_led_burst_starts_at_power_on(void) {
+    /* Front-loaded deliberately: somebody who glances at the board in its
+     * first seconds should see the announcement without waiting a period. */
+    assert(rr_identity_led_burst_active(0u));
+    assert(rr_identity_led_burst_active(RR_IDENTITY_LED_BURST_MS - 1u));
+}
+
+static void test_led_burst_ends_after_its_window(void) {
+    assert(!rr_identity_led_burst_active(RR_IDENTITY_LED_BURST_MS));
+    assert(!rr_identity_led_burst_active(RR_IDENTITY_LED_PERIOD_MS - 1u));
+}
+
+static void test_led_burst_repeats_every_period(void) {
+    assert(rr_identity_led_burst_active(RR_IDENTITY_LED_PERIOD_MS));
+    assert(rr_identity_led_burst_active(
+        RR_IDENTITY_LED_PERIOD_MS + RR_IDENTITY_LED_BURST_MS - 1u));
+    assert(!rr_identity_led_burst_active(
+        RR_IDENTITY_LED_PERIOD_MS + RR_IDENTITY_LED_BURST_MS));
+
+    assert(rr_identity_led_burst_active(10u * RR_IDENTITY_LED_PERIOD_MS));
+    assert(!rr_identity_led_burst_active(
+        (10u * RR_IDENTITY_LED_PERIOD_MS) + RR_IDENTITY_LED_BURST_MS));
+}
+
+static void test_led_burst_duty_cycle_stays_out_of_the_way(void) {
+    /* The bring-up loop - load filament, read BLUE, trim, read BLUE, trim -
+     * runs for minutes with somebody watching. The burst has to be short
+     * enough never to obscure that readout. Sampled across a full period
+     * rather than asserted against the constants, so this measures the
+     * function's actual behaviour instead of restating its #defines. */
+    uint32_t active = 0u;
+
+    for (uint32_t ms = 0u; ms < RR_IDENTITY_LED_PERIOD_MS; ++ms) {
+        if (rr_identity_led_burst_active(ms)) {
+            ++active;
+        }
+    }
+
+    assert(active == RR_IDENTITY_LED_BURST_MS);
+    assert(active * 20u <= RR_IDENTITY_LED_PERIOD_MS);
+}
+
 int main(void) {
     test_reports_identity_state();
     test_reports_provisioned_serial();
@@ -168,5 +210,9 @@ int main(void) {
     test_locked_without_a_valid_identity();
     test_unlocked_once_provisioned();
     test_identity_window_readable_while_locked();
+    test_led_burst_starts_at_power_on();
+    test_led_burst_ends_after_its_window();
+    test_led_burst_repeats_every_period();
+    test_led_burst_duty_cycle_stays_out_of_the_way();
     return 0;
 }

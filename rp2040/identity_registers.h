@@ -55,4 +55,19 @@ bool rr_identity_registers_read(uint8_t reg, uint8_t *buf, size_t *length);
  * defaulting open - see docs/roadrunner-identity-gate-design.md. */
 bool rr_identity_registers_locked(void);
 
+/* Unprovisioned announcement cadence. The bring-up procedure reads the LED for
+ * minutes at a time - load filament, read BLUE, trim the lever arm, read BLUE,
+ * trim again, until GREEN - so a boot-only announcement would be missed and a
+ * continuous one would fight the readout somebody is actually using. A short
+ * burst on a long period is seen several times without ever obscuring it.
+ *
+ * RR_IDENTITY_LED_BLINK_MS is deliberately faster than the 100 ms RED magnet
+ * blink in main.c, so the two read as different channels rather than as a new
+ * sensor state - hue alone is too weak a signal between amber and red. */
+#define RR_IDENTITY_LED_BURST_MS 1500u
+#define RR_IDENTITY_LED_PERIOD_MS 30000u
+#define RR_IDENTITY_LED_BLINK_MS 50u
+
+bool rr_identity_led_burst_active(uint32_t now_ms);
+
 #endif

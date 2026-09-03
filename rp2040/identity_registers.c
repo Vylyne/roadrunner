@@ -91,3 +91,12 @@ bool rr_identity_registers_locked(void)
 {
     return rr_identity_registers_config.identity_status != RR_IDENTITY_OK;
 }
+
+bool rr_identity_led_burst_active(uint32_t now_ms)
+{
+    /* RR_IDENTITY_LED_PERIOD_MS does not divide 2^32, so the phase jumps once
+     * when the millisecond counter wraps at ~49.7 days. That costs one
+     * mistimed burst on a board that has been unprovisioned for seven weeks,
+     * which is not worth carrying state to avoid. */
+    return (now_ms % RR_IDENTITY_LED_PERIOD_MS) < RR_IDENTITY_LED_BURST_MS;
+}
