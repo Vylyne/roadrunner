@@ -38,8 +38,13 @@ its encoder and filament-presence data into runout and under-extrusion signals.
 - Build from `rp2040/` in an ignored build directory, for example:
   `cmake -S . -B build && cmake --build build`.
 - Run `git diff --check` before handing off a change.
-- There is no automated firmware test suite yet.  State this plainly and
-  describe the exact bench-hardware validation that remains.
+- Run the host test suite before handing off:
+  `cmake --build rp2040/tests/build && ctest --test-dir rp2040/tests/build --output-on-failure`.
+  A fresh configure needs an explicit generator and compiler, because the
+  default generator resolves to nmake and fails:
+  `cmake -S rp2040/tests -B rp2040/tests/build -G Ninja -DCMAKE_C_COMPILER=<your gcc>`.
+  Bench-hardware validation is still required for anything touching a
+  transport; state plainly what was and was not exercised on real hardware.
 
 ## Documentation and commits
 

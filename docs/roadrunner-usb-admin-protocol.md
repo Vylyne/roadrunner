@@ -53,7 +53,7 @@ The status byte values are:
 | `00` | `OK` | Operation succeeded |
 | `01` | `BAD_CRC` | Frame CRC did not match |
 | `02` | `BAD_LENGTH` | Opcode payload length was invalid, or exceeded 64 |
-| `03` | `UNPROVISIONED` | INFO status: no valid identity is stored |
+| `03` | `UNPROVISIONED` | INFO status: no valid identity is stored, **or** refusal: this opcode requires a valid identity |
 | `04` | `ALREADY_PROVISIONED` | Provisioning was refused because an identity exists |
 | `05` | `IDENTITY_CONFLICT` | Two valid identity records disagree |
 | `06` | `STORE_IO_ERROR` | Flash erase, program, or verification failed |
@@ -63,6 +63,35 @@ The status byte values are:
 It never replaces an existing identity, including when the UUID is identical.
 `CLEAR_IDENTITY` is an explicit maintenance action and erases the reserved
 identity sector only after the confirmation payload matches exactly.
+
+### Status `03` has two roles
+
+`03` (`UNPROVISIONED`) is overloaded, and a host must not confuse its two
+shapes. As an **INFO status**, it is byte 0 of a full, multi-field INFO
+payload (see below) — it means "no valid identity is stored," not a refusal.
+As a **refusal**, it is the entire response payload: a single status byte,
+returned instead of an opcode's normal successful payload, meaning "this
+opcode requires a valid identity and was not performed." A host that reads
+`03` must first check which opcode the response echoes; only an `INFO` reply
+carries the longer shape.
+
+The opcode gate, by identity-store state:
+
+| Opcode | `NONE` | `CONFLICT` / `IO_ERROR` | `OK` |
+| --- | --- | --- | --- |
+| `INFO` | allowed | allowed | allowed |
+| `PROVISION_UUID` | allowed | allowed (store decides) | refused `04` |
+| `CLEAR_IDENTITY` | refused `03` | allowed | allowed |
+| `REBOOT_BOOTSEL` | refused `03` | refused `03` | allowed |
+
+`REBOOT_BOOTSEL` is refused unless the identity status is exactly `OK`: there
+is no reason to reflash a board that cannot be used, and refusing keeps this
+interface read-plus-provision only until an identity exists.
+
+`CLEAR_IDENTITY`'s gate is deliberately asymmetric with `REBOOT_BOOTSEL`'s: it
+is refused only when the status is `NONE`, not unless it is `OK`. `CONFLICT`
+and `IO_ERROR` are precisely the states a clear exists to recover from, so
+gating clear on `OK` would lock a broken board out of its own repair path.
 
 ## INFO response
 
@@ -82,6 +111,66 @@ The INFO response payload fields occur in this order:
 The maximum INFO payload is 93 bytes with the current field limits (and is
 within the 96-byte response limit). Integers are unsigned bytes; strings are
 not NUL-terminated in the frame.
+
+## Identity register window
+
+A fixed range of registers exposes the same identity fields as `INFO`,
+directly on the sensor transport itself:
+
+| Register | Name | Size | Content |
+| ---: | --- | ---: | --- |
+| `0x30` | `READ_IDENTITY_STATE` | 1 | `rr_identity_status_t` — `0` none, `1` ok, `2` conflict, `3` already provisioned, `4` I/O error |
+| `0x31` | `READ_SERIAL` | 34 | ASCII, NUL-padded |
+| `0x32` | `READ_FIRMWARE_VERSION` | 32 | ASCII, NUL-padded |
+| `0x33` | `READ_VARIANT` | 2 | transport byte, LED-order byte |
+| `0x34` | `READ_FLASH_UID` | 8 | Raw diagnostic bytes |
+
+These five registers are readable over I2C, UART, and usbserial, whether or
+not the board is provisioned — they are both the unprovisioned allow-list and
+the steady-state identity source. Field order and encoding mirror the USB
+`INFO` payload deliberately, so this document stays the single definition of
+what a Roadrunner's identity is, with `INFO` and this window as two
+encodings of it.
+
+`READ_FIRMWARE_VERSION` (`0x32`) is 32 bytes **including** the NUL
+terminator, so it holds at most 31 characters of version string — one fewer
+than the unterminated 32-byte version field `INFO` can carry. A 32-character
+version therefore survives `INFO` intact but truncates to 31 characters in
+the register. This is a known, accepted divergence between the two
+encodings, not a bug.
+
+Hosts must not persist the flash UID (`0x34`) as an identity; it is a
+diagnostic value only and is not guaranteed unique across boards from the
+same batch.
+
+### The gate on every other register
+
+While the board has no valid identity — `READ_IDENTITY_STATE` is anything
+other than `1` (`OK`), which includes `CONFLICT` and `IO_ERROR`, not only
+`NONE` — every register outside the identity window (`0x30`–`0x34`) returns
+its normal length filled with `0xFF`. A host must read `READ_IDENTITY_STATE`
+(`0x30`) to distinguish a locked board from a genuine sensor fault — `0xFF`
+is out of range for almost every field, so an unpatched host reads visibly
+broken rather than plausibly wrong.
+
+**One exception:** `state.filament_present` is a `bool`, so `0xFF` at
+`READ_FILAMENT_PRESENCE` (`0x22`) is *truthy*. A host reading that register
+in isolation on a locked board sees "filament present" — plausibly wrong,
+not visibly broken, which is the opposite of what the refusal encoding is
+meant to achieve. This is accepted rather than fixed with a per-register
+sentinel table, because that would be more code, more to keep in step, and
+still not authoritative. Two mitigations exist: `READ_ALL` carries
+`magnet_state = 0xFF` in the same payload, which *is* out of range for every
+defined `MAGNET_STATE_*`, and `READ_IDENTITY_STATE` (`0x30`) is the
+authoritative answer any host is expected to consult. No host should
+conclude a locked board is reporting real filament from `0x22` alone.
+
+The board never returns a zero-length response, provisioned or not. Silence
+is indistinguishable from a wiring fault on I2C or a dead board on
+TMC-UART, so a blocked read always answers at its normal length. Separately,
+over I2C a read that runs past a register's payload returns `0x00` filler —
+that is the transport's end-of-payload behaviour, distinct from the `0xFF`
+refusal encoding, and the two never occupy the same byte position.
 
 ## Identity and updater rules
 
