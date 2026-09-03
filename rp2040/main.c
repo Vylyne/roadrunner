@@ -233,6 +233,16 @@ void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
     } else if(reg == READ_ANGLE) {
         MEMCPY_REG_DATA(buf, state.angle, *length);
     }
+
+    /* An unprovisioned board answers, but says nothing. Silence is not an
+     * option: an I2C target that stops ACKing reads as a wiring fault and a
+     * quiet TMC-UART reads as a dead board, and both send somebody hunting
+     * hardware problems that do not exist. 0xff is out of range for every
+     * field here - it is no defined MAGNET_STATE_*, no plausible presence
+     * flag, and 0xffffffff is no plausible angle or turn count - so an
+     * unpatched host reads visibly broken rather than plausibly wrong. */
+    if(rr_identity_registers_locked())
+        memset(buf, 0xff, *length);
 }
 
 int main() {

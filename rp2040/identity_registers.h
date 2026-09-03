@@ -48,4 +48,11 @@ void rr_identity_registers_init(
  * can fall through to its own register handling. */
 bool rr_identity_registers_read(uint8_t reg, uint8_t *buf, size_t *length);
 
+/* True when the board has no valid identity and must not serve sensor data to
+ * a host. Every status other than RR_IDENTITY_OK locks: NONE has no identity,
+ * CONFLICT cannot say which of two it is, and IO_ERROR could not find out.
+ * ALREADY_PROVISIONED is not a load result, but it locks too rather than
+ * defaulting open - see docs/roadrunner-identity-gate-design.md. */
+bool rr_identity_registers_locked(void);
+
 #endif

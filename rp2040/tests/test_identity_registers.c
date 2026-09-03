@@ -124,6 +124,38 @@ static void test_ignores_unknown_registers(void) {
     assert(!rr_identity_registers_read(0x35u, buf, &length));
 }
 
+static void test_locked_without_a_valid_identity(void) {
+    configure(RR_IDENTITY_NONE);
+    assert(rr_identity_registers_locked());
+
+    configure(RR_IDENTITY_CONFLICT);
+    assert(rr_identity_registers_locked());
+
+    configure(RR_IDENTITY_IO_ERROR);
+    assert(rr_identity_registers_locked());
+
+    configure(RR_IDENTITY_ALREADY_PROVISIONED);
+    assert(rr_identity_registers_locked());
+}
+
+static void test_unlocked_once_provisioned(void) {
+    configure(RR_IDENTITY_OK);
+    assert(!rr_identity_registers_locked());
+}
+
+static void test_identity_window_readable_while_locked(void) {
+    uint8_t buf[64];
+    size_t length = 0u;
+
+    configure(RR_IDENTITY_NONE);
+    assert(rr_identity_registers_locked());
+    assert(rr_identity_registers_read(RR_REG_IDENTITY_STATE, buf, &length));
+    assert(rr_identity_registers_read(RR_REG_SERIAL, buf, &length));
+    assert(rr_identity_registers_read(RR_REG_FIRMWARE_VERSION, buf, &length));
+    assert(rr_identity_registers_read(RR_REG_VARIANT, buf, &length));
+    assert(rr_identity_registers_read(RR_REG_FLASH_UID, buf, &length));
+}
+
 int main(void) {
     test_reports_identity_state();
     test_reports_provisioned_serial();
@@ -133,5 +165,8 @@ int main(void) {
     test_reports_variant();
     test_reports_flash_uid();
     test_ignores_unknown_registers();
+    test_locked_without_a_valid_identity();
+    test_unlocked_once_provisioned();
+    test_identity_window_readable_while_locked();
     return 0;
 }

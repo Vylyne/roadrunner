@@ -86,3 +86,8 @@ bool rr_identity_registers_read(uint8_t reg, uint8_t *buf, size_t *length)
         return false;
     }
 }
+
+bool rr_identity_registers_locked(void)
+{
+    return rr_identity_registers_config.identity_status != RR_IDENTITY_OK;
+}
