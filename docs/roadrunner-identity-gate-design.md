@@ -76,13 +76,21 @@ revisit it.
 | --- | --- | --- |
 | mcu-updater, opt-in auto | mcu-updater users | USB admin |
 | mcu-updater, manual | mcu-updater users | USB admin |
-| `scripts/roadrunner_usb.py` | USB wired, no mcu-updater | USB admin |
-| klippy extra, on connect | Klipper-only, I2C/UART wired | I2C / UART / usbserial |
+| `scripts/roadrunner_usb.py` (in mcu-updater) | USB wired, no mcu-updater | USB admin |
+| klippy extra, on connect | Klipper-only | usbserial only, until the write path lands |
 
 The USB admin layer is present on all six builds ({I2C, UART, USB} × {RGB, GRB}),
-so the first three cover anyone with a USB cable attached. The fourth exists
-because not everyone wires one — for an I2C-only installation it is the only
-route, which is why it is a requirement and not a convenience.
+so the first three cover anyone with a USB cable attached.
+
+**Correction, 2026-09-03.** An earlier version of this table claimed the fourth
+path serves an I2C-only or UART-only installation with no USB cable, and called
+that its reason for existing. That is wrong, and it contradicted this document's
+own "Still required" section: neither `i2c_target.c` nor `tmcuart.c` has a write
+path, so the klippy extra can provision over usbserial only. **An I2C-only or
+UART-only installation needs a USB cable once**, until provisioning writes over
+those transports are built. The fourth path still earns its place — it is the
+route for a Klipper host with no mcu-updater — but not for the reason first
+given.
 
 ## Firmware design
 
@@ -158,24 +166,46 @@ the USB admin layer for any opcode other than `INFO` and `PROVISION_UUID` while
 unprovisioned. The protocol doc must say so, or a host reading `0x03` off a
 blocked command misreads it as an `INFO` reply.
 
-`REBOOT_BOOTSEL` is included in the refusal set while unprovisioned: there is no
-reason to reflash a board that cannot be used, and allowing it widens the
-attack surface of an interface that is otherwise read-plus-provision only.
+`CLEAR_IDENTITY` is refused only when the status is `RR_IDENTITY_NONE` — there
+is genuinely nothing to erase. It is **not** gated on `status == RR_IDENTITY_OK`.
 
-`CLEAR_IDENTITY` is **not** gated the same way, and the difference matters.
-`RR_IDENTITY_CONFLICT` and `RR_IDENTITY_IO_ERROR` are exactly the states a clear
-exists to recover from, so gating clear on `status == RR_IDENTITY_OK` would lock
-a conflicted board out of its own repair path. Clear is refused only when the
-status is `RR_IDENTITY_NONE` — there is genuinely nothing to erase.
+**`REBOOT_BOOTSEL` is not gated at all. Correction, 2026-09-03.** An earlier
+version of this document put it in the refusal set while unprovisioned, arguing
+"there is no reason to reflash a board that cannot be used." That reasoning is
+backwards, and following it produced a genuine dead end.
 
-The resulting opcode table while unprovisioned:
+`rr_identity_clear` refuses a conflicted sector outright —
+`identity_store.c:74-76` returns `RR_IDENTITY_CONFLICT` before erasing, and
+`tests/test_identity_record.c` asserts the sector is left byte-for-byte
+unchanged. So a conflicted board cannot be repaired by `CLEAR_IDENTITY`. With
+`REBOOT_BOOTSEL` also gated, such a board could do nothing over USB admin at
+all: `INFO` answers, `PROVISION_UUID` returns `05`, `CLEAR_IDENTITY` returns
+`05`, `REBOOT_BOOTSEL` returned `03`. Every software recovery path was closed.
 
-| Opcode | `NONE` | `CONFLICT` / `IO_ERROR` | `OK` |
-| --- | --- | --- | --- |
-| `INFO` | allowed | allowed | allowed |
-| `PROVISION_UUID` | allowed | allowed (store decides) | refused `04` |
-| `CLEAR_IDENTITY` | refused `03` | allowed | allowed |
-| `REBOOT_BOOTSEL` | refused `03` | refused `03` | allowed |
+A board that cannot be used is precisely the one you want to reflash. The gate
+had no beneficial case — it fired only on `NONE`, `CONFLICT` and `IO_ERROR`,
+and reflashing is the right action in all three. Reflashing is maintenance, not
+"doing its job", so it was never inside the invariant this design exists to
+enforce; normal UF2 updates preserve the identity sector, so it is not an
+identity bypass; and the physical BOOTSEL button meant the gate only ever
+blocked the convenient path, never a capable attacker.
+
+The resulting opcode table:
+
+| Opcode | `NONE` | `CONFLICT` | `IO_ERROR` | `OK` |
+| --- | --- | --- | --- | --- |
+| `INFO` | allowed | allowed | allowed | allowed |
+| `PROVISION_UUID` | allowed | refused `05` (store) | store decides | refused `04` |
+| `CLEAR_IDENTITY` | refused `03` | admitted, refused `05` by the store | store decides | allowed |
+| `REBOOT_BOOTSEL` | allowed | allowed | allowed | allowed |
+
+Note the two-stage behaviour of `CLEAR_IDENTITY`: the opcode gate admits it in
+every state but `NONE`, and the *store* then decides. A conflicted sector is
+never erased. `RR_IDENTITY_IO_ERROR` is recoverable only when the failure was at
+the verify stage with reads still working (`identity_store.c:77-82`); a
+read-failure `IO_ERROR` returns at `:70-72` without erasing. **`REBOOT_BOOTSEL`
+is therefore the recovery path for a conflicted board**, which is the concrete
+reason it must stay ungated.
 
 ### LED behaviour
 

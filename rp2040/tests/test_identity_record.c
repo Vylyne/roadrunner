@@ -451,43 +451,43 @@ static void test_usb_admin_acknowledges_before_bootsel_reboot(void) {
     assert(memcmp(io.events, "WFTR", io.event_length) == 0);
 }
 
-static void test_usb_admin_refuses_bootsel_while_unprovisioned(void) {
-    struct usb_admin_test_io io = {0};
+static void test_usb_admin_allows_bootsel_from_any_identity_state(void) {
+    /* BOOTSEL is deliberately ungated: it is the recovery path for exactly
+     * the identity states nothing else can repair. RR_IDENTITY_CONFLICT in
+     * particular has no other way out - rr_identity_clear() refuses to erase
+     * a conflicted sector (identity_store.c), so CLEAR_IDENTITY also returns
+     * an error for it. Gating REBOOT_BOOTSEL on RR_IDENTITY_OK, as an
+     * earlier revision did, would leave a conflicted board with no software
+     * recovery path at all. */
+    struct usb_admin_test_io io_none = {0};
+    struct rr_usb_admin_config config_none =
+        usb_admin_test_config(&io_none, NULL);
+    struct usb_admin_test_io io_conflict = {0};
+    struct rr_usb_admin_config config_conflict =
+        usb_admin_test_config(&io_conflict, NULL);
+
     /* identity_status defaults to RR_IDENTITY_NONE, exactly what
      * rr_identity_load() reports for a virgin board. */
-    struct rr_usb_admin_config config = usb_admin_test_config(&io, NULL);
-
-    config.reboot_bootsel = usb_admin_test_reboot_bootsel;
-    rr_usb_admin_init(&config);
+    config_none.reboot_bootsel = usb_admin_test_reboot_bootsel;
+    rr_usb_admin_init(&config_none);
 
     usb_admin_test_send_frame(RR_USB_ADMIN_REBOOT_BOOTSEL, NULL, 0u);
 
-    assert(io.response_length == 7u);
-    assert(io.response[3] == 0x82u);
-    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
-    assert(!io.rebooted);
-}
+    assert(io_none.response_length == 7u);
+    assert(io_none.response[3] == 0x82u);
+    assert(io_none.response[5] == 0x00u);
+    assert(io_none.rebooted);
 
-static void test_usb_admin_refuses_bootsel_while_conflicted(void) {
-    /* Defends the asymmetry itself: REBOOT_BOOTSEL must refuse on any
-     * identity_status other than RR_IDENTITY_OK, not merely on
-     * RR_IDENTITY_NONE. Collapsing the gate's condition in usb_admin.c to
-     * `== RR_IDENTITY_NONE` -- matching CLEAR_IDENTITY's condition -- would
-     * wrongly let a conflicted board reach BOOTSEL, and must turn this test
-     * red. */
-    struct usb_admin_test_io io = {0};
-    struct rr_usb_admin_config config = usb_admin_test_config(&io, NULL);
-
-    config.identity_status = RR_IDENTITY_CONFLICT;
-    config.reboot_bootsel = usb_admin_test_reboot_bootsel;
-    rr_usb_admin_init(&config);
+    config_conflict.identity_status = RR_IDENTITY_CONFLICT;
+    config_conflict.reboot_bootsel = usb_admin_test_reboot_bootsel;
+    rr_usb_admin_init(&config_conflict);
 
     usb_admin_test_send_frame(RR_USB_ADMIN_REBOOT_BOOTSEL, NULL, 0u);
 
-    assert(io.response_length == 7u);
-    assert(io.response[3] == 0x82u);
-    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
-    assert(!io.rebooted);
+    assert(io_conflict.response_length == 7u);
+    assert(io_conflict.response[3] == 0x82u);
+    assert(io_conflict.response[5] == 0x00u);
+    assert(io_conflict.rebooted);
 }
 
 static void test_usb_admin_refuses_clear_with_nothing_to_clear(void) {
@@ -687,8 +687,7 @@ int main(void) {
     test_usb_admin_rejects_short_provision_payload();
     test_usb_admin_clears_identity_after_confirmation();
     test_usb_admin_requires_clear_confirmation();
-    test_usb_admin_refuses_bootsel_while_unprovisioned();
-    test_usb_admin_refuses_bootsel_while_conflicted();
+    test_usb_admin_allows_bootsel_from_any_identity_state();
     test_usb_admin_refuses_clear_with_nothing_to_clear();
     test_usb_admin_allows_clear_to_repair_a_conflict();
     test_usb_admin_still_answers_info_while_unprovisioned();

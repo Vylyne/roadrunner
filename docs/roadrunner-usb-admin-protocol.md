@@ -81,17 +81,36 @@ The opcode gate, by identity-store state:
 | --- | --- | --- | --- |
 | `INFO` | allowed | allowed | allowed |
 | `PROVISION_UUID` | allowed | allowed (store decides) | refused `04` |
-| `CLEAR_IDENTITY` | refused `03` | allowed | allowed |
-| `REBOOT_BOOTSEL` | refused `03` | refused `03` | allowed |
+| `CLEAR_IDENTITY` | refused `03` | allowed (store decides) | allowed |
+| `REBOOT_BOOTSEL` | allowed | allowed | allowed |
 
-`REBOOT_BOOTSEL` is refused unless the identity status is exactly `OK`: there
-is no reason to reflash a board that cannot be used, and refusing keeps this
-interface read-plus-provision only until an identity exists.
+`REBOOT_BOOTSEL` is not gated on identity status at all. An earlier revision
+refused it unless the status was exactly `OK`, on the reasoning that there is
+no reason to reflash a board that cannot be used. That reasoning was
+backwards: a board that cannot be used over USB admin is precisely the one
+that needs reflashing, and a conflicted board (see below) has no other
+software recovery path. Reflashing is maintenance, not the sensor-serving
+behaviour the identity gate protects, and normal UF2 updates preserve the
+identity sector, so allowing `REBOOT_BOOTSEL` unconditionally is not an
+identity bypass.
 
-`CLEAR_IDENTITY`'s gate is deliberately asymmetric with `REBOOT_BOOTSEL`'s: it
-is refused only when the status is `NONE`, not unless it is `OK`. `CONFLICT`
-and `IO_ERROR` are precisely the states a clear exists to recover from, so
-gating clear on `OK` would lock a broken board out of its own repair path.
+`CLEAR_IDENTITY`'s gate is asymmetric with the other opcodes: it is refused
+only when the status is `NONE` — there is genuinely nothing to erase. For
+every other status the opcode is *admitted*, but the identity store still
+decides whether it can actually clear:
+
+- **`CONFLICT` is never recoverable by clear.** The store refuses to erase a
+  sector it cannot safely interpret, so `CLEAR_IDENTITY` returns `05`
+  (`IDENTITY_CONFLICT`) and leaves the sector byte-for-byte unchanged.
+  `REBOOT_BOOTSEL` — unconditionally allowed, as above — is the recovery path
+  for a conflicted board.
+- **`IO_ERROR` is sometimes recoverable.** A failure while re-reading the
+  sector to verify a successful erase reaches the erase step and may still
+  clear the record. A failure while reading the sector in the first place
+  does not reach the erase step at all, and returns `06` (`STORE_IO_ERROR`)
+  with nothing changed. A host cannot tell these apart from the response
+  alone; retrying `CLEAR_IDENTITY` is reasonable, and `REBOOT_BOOTSEL` remains
+  available regardless.
 
 ## INFO response
 
@@ -131,6 +150,12 @@ the steady-state identity source. Field order and encoding mirror the USB
 `INFO` payload deliberately, so this document stays the single definition of
 what a Roadrunner's identity is, with `INFO` and this window as two
 encodings of it.
+
+**The identity register window is read-only in this release.** There is no
+write path on I2C or UART: `i2c_target.c` reads and discards every byte after
+the register address, and the UART transport is request/response only. A
+board with no USB cable attached can be read over I2C or UART, but it can
+only be provisioned over the direct USB admin protocol above.
 
 `READ_FIRMWARE_VERSION` (`0x32`) is 32 bytes **including** the NUL
 terminator, so it holds at most 31 characters of version string — one fewer

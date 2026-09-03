@@ -54,6 +54,14 @@ until GREEN — so a boot-only announcement would be missed and a continuous
 one would fight the readout somebody is actually using. A short burst on a
 long period is seen several times without ever obscuring it.
 
+The first burst is shorter than the rest: firmware init holds a solid RED for
+about 1.1 seconds (a 100 ms neopixel settle plus a 1000 ms sensor-init delay)
+before the LED chain is reached for the first time, so only the tail of the
+first 1500 ms window is visible — roughly 400 ms of amber, not the full
+1500 ms. Every burst after that is the complete 1500 ms, since the burst
+window is timed from power-on rather than from when the LED chain starts
+running.
+
 Because `PROVISION_UUID` resets the board, **the absence of amber on the next
 boot is the provisioning success confirmation** — observable with no host, no
 tool, and no serial console. For an I2C-only user running an unpatched vendor

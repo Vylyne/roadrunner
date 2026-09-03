@@ -44,8 +44,12 @@ There are four intended ways to reach it:
 - mcu-updater, manual provisioning
 - a standalone USB provisioning script (planned; see
   `docs/roadrunner-identity-gate-design.md`)
-- the Klippy extra, on connect, when opted in — the only route for an
-  I2C-only or UART-only installation with no USB cable attached
+- the Klippy extra, on connect, when opted in — for an I2C- or UART-wired
+  Klipper install, over the board's usbserial admin connection
+
+There is no provisioning write path on I2C or UART yet, so **an I2C-only or
+UART-only installation needs a USB cable once**, even when using the Klippy
+extra's on-connect path — every route above ultimately goes over USB.
 
 ## TODO
 
