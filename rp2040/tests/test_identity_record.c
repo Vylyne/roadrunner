@@ -468,6 +468,28 @@ static void test_usb_admin_refuses_bootsel_while_unprovisioned(void) {
     assert(!io.rebooted);
 }
 
+static void test_usb_admin_refuses_bootsel_while_conflicted(void) {
+    /* Defends the asymmetry itself: REBOOT_BOOTSEL must refuse on any
+     * identity_status other than RR_IDENTITY_OK, not merely on
+     * RR_IDENTITY_NONE. Collapsing the gate's condition in usb_admin.c to
+     * `== RR_IDENTITY_NONE` -- matching CLEAR_IDENTITY's condition -- would
+     * wrongly let a conflicted board reach BOOTSEL, and must turn this test
+     * red. */
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = usb_admin_test_config(&io, NULL);
+
+    config.identity_status = RR_IDENTITY_CONFLICT;
+    config.reboot_bootsel = usb_admin_test_reboot_bootsel;
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_REBOOT_BOOTSEL, NULL, 0u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x82u);
+    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
+    assert(!io.rebooted);
+}
+
 static void test_usb_admin_refuses_clear_with_nothing_to_clear(void) {
     static const uint8_t confirmation[] = "RRCL";
     struct in_memory_store memory;
@@ -666,6 +688,7 @@ int main(void) {
     test_usb_admin_clears_identity_after_confirmation();
     test_usb_admin_requires_clear_confirmation();
     test_usb_admin_refuses_bootsel_while_unprovisioned();
+    test_usb_admin_refuses_bootsel_while_conflicted();
     test_usb_admin_refuses_clear_with_nothing_to_clear();
     test_usb_admin_allows_clear_to_repair_a_conflict();
     test_usb_admin_still_answers_info_while_unprovisioned();
