@@ -15,6 +15,8 @@
 static struct
 {
     uint8_t mem[256];
+    size_t mem_length;   /* bytes of mem[] valid for the current transaction */
+    size_t mem_position; /* next byte of mem[] to serve on I2C_SLAVE_REQUEST */
     uint8_t mem_address;
     bool mem_address_written;
 } context;
@@ -28,20 +30,48 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
             // writes always start with the memory address
             context.mem_address = i2c_read_byte_raw(i2c);
             context.mem_address_written = true;
+
+            /* Cache the payload once, here, at the point the register
+             * address becomes known - not per I2C_SLAVE_REQUEST below.
+             * The TX FIFO (IC_TX_BUFFER_DEPTH) is 16 bytes, smaller than
+             * some register payloads (up to 34 bytes), so RD_REQ re-fires
+             * once per byte once the FIFO drains; re-running
+             * prepare_register_data() on every one of those events would
+             * rebuild the serial string ~34 times inside an ISR while the
+             * bus clock-stretches. */
+            context.mem_length = 0;
+            context.mem_position = 0;
+            prepare_register_data(context.mem_address, context.mem, &context.mem_length);
         } else {
             /* read and discard, we do not support I2C writes */
             i2c_read_byte_raw(i2c);
         }
         break;
     case I2C_SLAVE_REQUEST: // master is requesting data
-    {
-        size_t length = 0;
-        prepare_register_data(context.mem_address, (uint8_t *)&context.mem, &length);
-        for(int i = 0; i < length; i++)
-            i2c_write_byte_raw(i2c, context.mem[i]);
+        /* Serve one byte per event from the cached payload, advancing
+         * mem_position. This is what makes a payload larger than the
+         * 16-byte TX FIFO work: the master re-issues RD_REQ for every byte
+         * it clocks out, and each call here answers exactly one of those,
+         * rather than trying to push the whole payload in a single burst
+         * that the FIFO would silently truncate. */
+        if (context.mem_position < context.mem_length) {
+            i2c_write_byte_raw(i2c, context.mem[context.mem_position]);
+            context.mem_position++;
+        } else {
+            /* Past the end of the payload (or an unknown register, where
+             * mem_length is 0): send a defined filler rather than walking
+             * off the buffer or re-serving stale bytes. */
+            i2c_write_byte_raw(i2c, 0x00);
+        }
         break;
-    }
-    case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
+    case I2C_SLAVE_FINISH: // master has signalled Stop, or a repeated Start
+        /* This also fires mid-transaction on a repeated START (e.g. between
+         * the register-address write and the read that follows it), not
+         * only on Stop. Do not reset mem_length or mem_position here: the
+         * cached payload built in I2C_SLAVE_RECEIVE must survive into the
+         * read phase. Only mem_address_written is reset, so the next write
+         * is treated as a fresh register address; mem_length/mem_position
+         * are re-armed there too, at the point a new address arrives. */
         context.mem_address_written = false;
         break;
     default:

@@ -37,6 +37,47 @@ You'll find multiple `.uf2` files in the `roadrunner-filament-sensor/rp2040/buil
 4. A drive named `RPI-RP2` will appear
 5. Copy newly built `.uf2` file to the drive to flash the new firmware.
 
+## LED indications
+
+| Condition | Indication |
+| --- | --- |
+| board has no valid identity (`rr_identity_registers_locked()`) | amber, 50 ms blink half-period, for 1500 ms, repeating every 30000 ms, first burst at power-on |
+| `magnet_state != MAGNET_STATE_DETECTED` | blink RED, 100 ms |
+| `!filament_present` | solid BLUE |
+| otherwise | solid GREEN |
+
+The blink half-periods (50 ms amber, 100 ms RED) assume `CLOCKS_PER_SEC ==
+100`, as provided by this toolchain — `neopixel.c` times blinking off its own
+`clock()`, which ticks every 10 ms, via
+`elapsed_since_blink() = (clock() - last) * 1000 / CLOCKS_PER_SEC`. A
+toolchain supplying a different `CLOCKS_PER_SEC` would scale both rates
+together, so the 2:1 ratio that makes the amber and RED blinks read as
+different channels survives regardless.
+
+The amber burst applies to any board without a valid identity, not only one
+that was never provisioned — a conflicting or unreadable identity record
+locks the board the same way. It is checked first in the LED chain, so it
+overrides the diagnostic indications while active, and yields the LED
+entirely between bursts. It exists because the bring-up procedure reads the
+LED for minutes at a time — load filament, read BLUE, trim the lever arm,
+read BLUE, trim again, until GREEN — so a boot-only announcement would be
+missed and a continuous one would fight the readout somebody is actually
+using. A short burst on a long period is seen several times without ever
+obscuring it.
+
+The first burst is shorter than the rest: firmware init holds a solid RED for
+about 1.1 seconds (a 100 ms neopixel settle plus a 1000 ms sensor-init delay)
+before the LED chain is reached for the first time, so only the tail of the
+first 1500 ms window is visible — roughly 400 ms of amber, not the full
+1500 ms. Every burst after that is the complete 1500 ms, since the burst
+window is timed from power-on rather than from when the LED chain starts
+running.
+
+Because `PROVISION_UUID` resets the board, **the absence of amber on the next
+boot is the provisioning success confirmation** — observable with no host, no
+tool, and no serial console. For an I2C-only user running an unpatched vendor
+extra, that is the entire feedback loop.
+
 ## Device identity and USB maintenance
 
 Each image reserves the final flash sector for a persistent Roadrunner device
@@ -66,13 +107,20 @@ value `0x00`, no reflection, final XOR `0x00`). `INFO` is opcode `0x01`,
 `CLEAR_IDENTITY` is opcode `0x04`; responses set bit `0x80` in the opcode.
 The status values are `0x00` OK, `0x01` bad CRC, `0x02` bad length, `0x03`
 unprovisioned, `0x04` already provisioned, `0x05` identity conflict, `0x06`
-identity-store I/O error, and `0x07` confirmation required.
+identity-store I/O error, and `0x07` confirmation required. `0x03` is
+overloaded: it is both the `INFO` status meaning "no valid identity stored"
+and the refusal a locked board returns for an opcode that requires one — see
+[`../docs/roadrunner-usb-admin-protocol.md`](../docs/roadrunner-usb-admin-protocol.md#status-03-has-two-roles)
+for which opcodes are gated and why `CLEAR_IDENTITY`'s gate is not symmetric
+with `REBOOT_BOOTSEL`'s.
 
 An `INFO` request has an empty payload. Its response payload is exactly:
 
 1. status;
-2. identity-store state (`0` none, `1` provisioned, `2` conflict, `3` already
-   provisioned, `4` I/O error);
+2. identity-store state (`0` none, `1` provisioned, `2` conflict, `4` I/O
+   error — this reports `rr_identity_load()`'s result; `3` already
+   provisioned is part of the enum but is only returned by
+   `rr_identity_provision()`, so INFO never reports it);
 3. transport (`1` I2C, `2` UART, `3` USB);
 4. LED order (`1` RGB, `2` GRB);
 5. model length and ASCII model (`roadrunner-v1`);

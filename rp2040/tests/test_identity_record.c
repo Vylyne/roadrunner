@@ -295,6 +295,7 @@ static void test_usb_admin_clears_identity_after_confirmation(void) {
     store = make_in_memory_store(&memory);
     assert(rr_identity_provision(&store, uuid) == RR_IDENTITY_OK);
     config = usb_admin_test_config(&io, &store);
+    config.identity_status = RR_IDENTITY_OK;
     rr_usb_admin_init(&config);
 
     usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
@@ -449,6 +450,115 @@ static void test_usb_admin_acknowledges_before_bootsel_reboot(void) {
     assert(memcmp(io.events, "WFTR", io.event_length) == 0);
 }
 
+static void test_usb_admin_allows_bootsel_from_any_identity_state(void) {
+    /* BOOTSEL is deliberately ungated: it is the recovery path for exactly
+     * the identity states nothing else can repair. RR_IDENTITY_CONFLICT in
+     * particular has no other way out - rr_identity_clear() refuses to erase
+     * a conflicted sector (identity_store.c), so CLEAR_IDENTITY also returns
+     * an error for it. Gating REBOOT_BOOTSEL on RR_IDENTITY_OK, as an
+     * earlier revision did, would leave a conflicted board with no software
+     * recovery path at all. */
+    struct usb_admin_test_io io_none = {0};
+    struct rr_usb_admin_config config_none =
+        usb_admin_test_config(&io_none, NULL);
+    struct usb_admin_test_io io_conflict = {0};
+    struct rr_usb_admin_config config_conflict =
+        usb_admin_test_config(&io_conflict, NULL);
+
+    /* identity_status defaults to RR_IDENTITY_NONE, exactly what
+     * rr_identity_load() reports for a virgin board. */
+    config_none.reboot_bootsel = usb_admin_test_reboot_bootsel;
+    rr_usb_admin_init(&config_none);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_REBOOT_BOOTSEL, NULL, 0u);
+
+    assert(io_none.response_length == 7u);
+    assert(io_none.response[3] == 0x82u);
+    assert(io_none.response[5] == 0x00u);
+    assert(io_none.rebooted);
+
+    config_conflict.identity_status = RR_IDENTITY_CONFLICT;
+    config_conflict.reboot_bootsel = usb_admin_test_reboot_bootsel;
+    rr_usb_admin_init(&config_conflict);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_REBOOT_BOOTSEL, NULL, 0u);
+
+    assert(io_conflict.response_length == 7u);
+    assert(io_conflict.response[3] == 0x82u);
+    assert(io_conflict.response[5] == 0x00u);
+    assert(io_conflict.rebooted);
+}
+
+static void test_usb_admin_refuses_clear_with_nothing_to_clear(void) {
+    static const uint8_t confirmation[] = "RRCL";
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    config = usb_admin_test_config(&io, &store);
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
+                              sizeof(confirmation) - 1u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x84u);
+    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
+    assert(!io.rebooted);
+}
+
+static void test_usb_admin_clear_gate_admits_a_non_none_status(void) {
+    /* This exercises the opcode gate only: config.identity_status is set
+     * to RR_IDENTITY_CONFLICT directly, but the store underneath was never
+     * put into a genuine two-slot disagreement, so rr_identity_clear() sees
+     * a clean store and erases it. The gate admits CLEAR_IDENTITY for any
+     * status but RR_IDENTITY_NONE; it does not follow that clear can repair
+     * a real conflict - the store refuses that, proven negatively by the
+     * store-level test around test_identity_record.c:663-671. */
+    static const uint8_t confirmation[] = "RRCL";
+    uint8_t uuid[RR_IDENTITY_UUID_SIZE] = {0x12};
+    struct in_memory_store memory;
+    struct rr_identity_store store;
+    struct rr_identity identity;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config;
+
+    initialize_in_memory_store(&memory);
+    store = make_in_memory_store(&memory);
+    assert(rr_identity_provision(&store, uuid) == RR_IDENTITY_OK);
+    config = usb_admin_test_config(&io, &store);
+    config.identity_status = RR_IDENTITY_CONFLICT;
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_CLEAR_IDENTITY, confirmation,
+                              sizeof(confirmation) - 1u);
+
+    assert(io.response_length == 7u);
+    assert(io.response[3] == 0x84u);
+    assert(io.response[5] == 0x00u);
+    assert(rr_identity_load(&store, &identity) == RR_IDENTITY_NONE);
+}
+
+static void test_usb_admin_still_answers_info_while_unprovisioned(void) {
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = usb_admin_test_config(&io, NULL);
+
+    rr_usb_admin_init(&config);
+
+    usb_admin_test_send_frame(RR_USB_ADMIN_INFO, NULL, 0u);
+
+    /* INFO carries 0x03 as its status *field*, inside a full payload. A
+     * refused opcode carries 0x03 as a one-byte status. Hosts must not
+     * confuse the two, so the difference is pinned here and spelled out in
+     * docs/roadrunner-usb-admin-protocol.md. */
+    assert(io.response[3] == 0x81u);
+    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
+    assert(io.response_length > 7u);
+}
+
 int main(void) {
     uint8_t erased[ROADRUNNER_IDENTITY_RECORD_SIZE];
     uint8_t valid[ROADRUNNER_IDENTITY_RECORD_SIZE];
@@ -581,5 +691,9 @@ int main(void) {
     test_usb_admin_rejects_short_provision_payload();
     test_usb_admin_clears_identity_after_confirmation();
     test_usb_admin_requires_clear_confirmation();
+    test_usb_admin_allows_bootsel_from_any_identity_state();
+    test_usb_admin_refuses_clear_with_nothing_to_clear();
+    test_usb_admin_clear_gate_admits_a_non_none_status();
+    test_usb_admin_still_answers_info_while_unprovisioned();
     return 0;
 }

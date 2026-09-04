@@ -22,6 +22,7 @@
 #include "usbserial.h"
 #include "identity_store.h"
 #include "usb_admin.h"
+#include "identity_registers.h"
 
 void rr_usb_descriptors_init(const struct rr_identity_store *store);
 
@@ -75,6 +76,19 @@ static void rr_usb_admin_init_for_firmware(
 
     pico_get_unique_board_id(&board_id);
     memcpy(rr_usb_admin_flash_uid, board_id.id, sizeof(rr_usb_admin_flash_uid));
+
+    {
+        struct rr_identity_registers_config register_config = {
+            .identity_status = config.identity_status,
+            .identity = config.identity,
+            .flash_uid = config.flash_uid,
+            .transport = config.transport,
+            .led_order = config.led_order,
+            .firmware_version = config.firmware_version,
+        };
+        rr_identity_registers_init(&register_config);
+    }
+
     rr_usb_admin_init(&config);
 }
 
@@ -203,6 +217,18 @@ void update_loop()
 
 void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
 {
+    /* Zero first: the 0xff memset below runs unconditionally on *length
+     * bytes when locked, so an unknown register with an uninitialised
+     * length would turn into an out-of-bounds write into the caller's
+     * buffer instead of just a bad frame. Every current caller already
+     * zeroes length before calling, so this is a no-op for them - it just
+     * makes the function safe on its own rather than relying on a
+     * precondition that isn't written down anywhere. */
+    *length = 0;
+
+    if(rr_identity_registers_read(reg, buf, length))
+        return;
+
     if(reg == READ_ALL) {
         MEMCPY_REG_DATA(buf, state, *length);
     // } else if(reg == READ_HEALTH) {
@@ -216,6 +242,16 @@ void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
     } else if(reg == READ_ANGLE) {
         MEMCPY_REG_DATA(buf, state.angle, *length);
     }
+
+    /* An unprovisioned board answers, but says nothing. Silence is not an
+     * option: an I2C target that stops ACKing reads as a wiring fault and a
+     * quiet TMC-UART reads as a dead board, and both send somebody hunting
+     * hardware problems that do not exist. 0xff is out of range for every
+     * field here - it is no defined MAGNET_STATE_*, no plausible presence
+     * flag, and 0xffffffff is no plausible angle or turn count - so an
+     * unpatched host reads visibly broken rather than plausibly wrong. */
+    if(rr_identity_registers_locked())
+        memset(buf, 0xff, *length);
 }
 
 int main() {
@@ -257,7 +293,14 @@ int main() {
         rr_usb_admin_poll();
         update_loop();
 
-        if(state.magnet_state != MAGNET_STATE_DETECTED) {
+        if(rr_identity_registers_locked()
+           && rr_identity_led_burst_active((uint32_t)(time_us_64() / 1000u))) {
+            /* Between bursts the diagnostics own the LED completely. Because
+             * PROVISION_UUID resets the board, the absence of amber on the
+             * next boot is the success confirmation - visible with no host,
+             * no tool and no serial console. */
+            neopixel_blink(AMBER, RR_IDENTITY_LED_BLINK_MS);
+        } else if(state.magnet_state != MAGNET_STATE_DETECTED) {
             neopixel_blink(RED, 100);
         } else if(!state.filament_present) {
             neopixel_solid(BLUE);
