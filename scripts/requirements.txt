@@ -4,3 +4,4 @@ argparse
 aiohttp
 mergedeep
 pytest
+pyserial
