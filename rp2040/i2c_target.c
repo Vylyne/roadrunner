@@ -64,10 +64,15 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
             i2c_write_byte_raw(i2c, 0x00);
         }
         break;
-    case I2C_SLAVE_FINISH: // master has signalled Stop / Restart
+    case I2C_SLAVE_FINISH: // master has signalled Stop, or a repeated Start
+        /* This also fires mid-transaction on a repeated START (e.g. between
+         * the register-address write and the read that follows it), not
+         * only on Stop. Do not reset mem_length or mem_position here: the
+         * cached payload built in I2C_SLAVE_RECEIVE must survive into the
+         * read phase. Only mem_address_written is reset, so the next write
+         * is treated as a fresh register address; mem_length/mem_position
+         * are re-armed there too, at the point a new address arrives. */
         context.mem_address_written = false;
-        context.mem_length = 0;
-        context.mem_position = 0;
         break;
     default:
         break;

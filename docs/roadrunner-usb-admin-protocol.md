@@ -138,7 +138,7 @@ directly on the sensor transport itself:
 
 | Register | Name | Size | Content |
 | ---: | --- | ---: | --- |
-| `0x30` | `READ_IDENTITY_STATE` | 1 | `rr_identity_status_t` — `0` none, `1` ok, `2` conflict, `3` already provisioned, `4` I/O error |
+| `0x30` | `READ_IDENTITY_STATE` | 1 | `rr_identity_status_t` — `0` none, `1` ok, `2` conflict, `4` I/O error (this register reports `rr_identity_load()`'s result; `3` already provisioned is part of the enum but is only returned by `rr_identity_provision()`, so it is never observable here) |
 | `0x31` | `READ_SERIAL` | 34 | ASCII, NUL-padded |
 | `0x32` | `READ_FIRMWARE_VERSION` | 32 | ASCII, NUL-padded |
 | `0x33` | `READ_VARIANT` | 2 | transport byte, LED-order byte |

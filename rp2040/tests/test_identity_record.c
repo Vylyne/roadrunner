@@ -431,7 +431,6 @@ static void test_usb_admin_acknowledges_before_bootsel_reboot(void) {
     };
     struct usb_admin_test_io io = {0};
     struct rr_usb_admin_config config = {
-        .identity_status = RR_IDENTITY_OK,
         .context = &io,
         .write = usb_admin_test_write,
         .flush = usb_admin_test_flush,

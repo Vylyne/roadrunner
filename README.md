@@ -20,20 +20,22 @@
 - [x] Klipper runout, under-extrusion, and calibration support
 - [x] Persistent provisioned device identities with safe USB diagnostics
 - [x] Direct USB maintenance and ROM BOOTSEL recovery
-- [x] A board refuses to serve sensor data until it is provisioned
+- [x] A board without a valid identity refuses to serve sensor data
 
 Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
 UF2 update preserves the identity record; the direct-USB `CLEAR_IDENTITY`
 maintenance command is the only way to clear it.
 
 **A Roadrunner serves no sensor data on any transport — I2C, UART, or USB —
-until it is provisioned. This is by design**, not a bug: it is the invariant
-that keeps every provisioning path safe to use without its own hand-written
-guard (see `docs/roadrunner-identity-gate-design.md`). A board that is
-flashed and never provisioned is inert; on I2C and UART it announces this
-with a short amber LED burst every 30 seconds, and the absence of that burst
-on the next boot after provisioning is the confirmation it worked. If your
-Roadrunner "does not work" after flashing, provision it first.
+until it has a valid identity. This is by design**, not a bug: it is the
+invariant that keeps every provisioning path safe to use without its own
+hand-written guard (see `docs/roadrunner-identity-gate-design.md`). A board
+that is flashed and never provisioned, or whose identity record cannot be
+trusted (a conflicting or unreadable record, not only an absent one), is
+inert; on I2C and UART it announces this with a short amber LED burst every
+30 seconds, and the absence of that burst on the next boot after
+provisioning is the confirmation it worked. If your Roadrunner "does not
+work" after flashing, provision it first.
 
 Every provisioning path is built on the same firmware primitive: the direct
 USB admin `PROVISION_UUID` opcode, which works today on all six firmware
