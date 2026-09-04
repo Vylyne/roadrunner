@@ -25,6 +25,20 @@ target_include_directories(roadrunner_identity_register_tests PRIVATE ..)
 
 add_test(NAME identity_registers COMMAND roadrunner_identity_register_tests)
 
+# The I2C target's register-serving state machine, driven off-target.
+#
+# `i2c_target.c` is not listed as a source: the test #includes it, because the
+# handler is file-static and this keeps the firmware free of test-only
+# visibility changes. `stubs/` must precede `..` on the include path so its
+# minimal <pico/stdlib.h>, <hardware/i2c.h> and <pico/i2c_slave.h> stand in for
+# the SDK headers, which are unavailable and unwanted on the host.
+add_executable(roadrunner_i2c_target_tests
+    test_i2c_target.c
+)
+target_include_directories(roadrunner_i2c_target_tests PRIVATE stubs ..)
+
+add_test(NAME i2c_target COMMAND roadrunner_i2c_target_tests)
+
 set(ROADRUNNER_STDIO_USB_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../main.c
     ${CMAKE_CURRENT_LIST_DIR}/../as5600.c
