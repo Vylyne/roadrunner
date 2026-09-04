@@ -224,6 +224,49 @@ def test_usbserial_locked(port: str) -> None:
     print("gate holds: sensor registers refused, identity window readable")
 
 
+def test_bootsel_while_locked(uf2: Path, port: str) -> str:
+    """REBOOT_BOOTSEL must work on a board with no valid identity.
+
+    This is the one path that recovers a board the firmware otherwise refuses
+    to serve: `rr_identity_clear` will not erase a conflicted sector, so a
+    board in that state cannot be repaired by CLEAR_IDENTITY either. An earlier
+    revision gated BOOTSEL on a valid identity and thereby closed every
+    software route out. Ungating it is the fix, and this is the only test of
+    that fix which touches real hardware.
+
+    Leaves the board back in application mode and still unprovisioned, by
+    reflashing the same image - a normal UF2 update preserves the identity
+    sector, so an erased sector stays erased. Returns the new port.
+    """
+    status, _ = send_admin(port, OPCODE_REBOOT_BOOTSEL)
+    if status == STATUS_UNPROVISIONED:
+        raise SystemExit(
+            "REBOOT_BOOTSEL was refused with 0x03 on a board with no valid "
+            "identity. That gate was removed deliberately: with it, a "
+            "conflicted board has no software recovery path at all, because "
+            "CLEAR_IDENTITY cannot erase a conflicted sector either. This "
+            "firmware predates that fix, or it has regressed."
+        )
+    if status != STATUS_OK:
+        raise SystemExit(
+            f"REBOOT_BOOTSEL on an unprovisioned board failed with status {status:#04x}"
+        )
+
+    volume = wait_for_bootsel_mount()
+    print("BOOTSEL reachable without an identity")
+
+    shutil.copy(uf2, volume / uf2.name)
+    new_port = wait_for_serial_port()
+    result = info(new_port)
+    if result["provisioned"]:
+        raise SystemExit(
+            f"reflashing should preserve an erased identity sector, but the "
+            f"board came back provisioned as {result['serial']}"
+        )
+    print(f"reflashed, still unprovisioned; port: {new_port}")
+    return new_port
+
+
 def test_usbserial(port: str) -> None:
     payload = read_register(port, 0x10, 10)
     magnet, filament, turns, angle = struct.unpack("<BBll", payload)
@@ -441,6 +484,7 @@ def flash_and_test(uf2: Path) -> None:
     # window in the run where the refusal behaviour is observable at all.
     if "usbserial" in uf2.name:
         test_usbserial_locked(port)
+        port = test_bootsel_while_locked(uf2, port)
 
     new_serial = provision_uuid(port)
     wait_for_disconnect(port)  # PROVISION_UUID resets and re-enumerates
