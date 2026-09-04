@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-import glob
 import os
+import re
 import shutil
+import string
 import struct
 import subprocess
 import time
 import uuid
 from pathlib import Path
 
-import serial # pyright: ignore[reportMissingModuleSource]
+import serial  # pyright: ignore[reportMissingModuleSource]
+import serial.tools.list_ports  # pyright: ignore[reportMissingModuleSource]
 
 SYNC = bytes.fromhex("52 52 01")
 
@@ -24,8 +26,28 @@ STATUS_CONFIRMATION_REQUIRED = 0x07
 
 CLEAR_CONFIRMATION = b"RRCL"
 
-PORT_GLOB = "/dev/serial/by-id/usb-Vylyne_Roadrunner_RR*"
-BOOTSEL_MOUNT = Path("/media/klipper/RPI-RP2")
+# Boards this script must never touch. Every step here is destructive - it
+# reboots to BOOTSEL and reflashes - so anything installed in a printer belongs
+# on this list. Entries are the serial as reported over USB, with or without
+# the "RR-" prefix.
+#
+# A typo here is the failure that reflashes a live board, so `check_exclusions`
+# refuses to run on a malformed entry rather than silently protecting nothing.
+EXCLUDED_SERIALS = ("5K3DNTFCR1B3C9D0RZMYA3Y720", "16NVDWH76ET5WG3TTEQN8HQ73A")
+
+USB_MANUFACTURER = "Vylyne"
+USB_PRODUCT = "Roadrunner"
+
+# A provisioned serial is RR- plus 26 Crockford base32 characters (no I/L/O/U);
+# an unprovisioned one is RR-UNPROVISIONED- plus the 16-hex flash UID.
+PROVISIONED_RE = re.compile(r"^RR-[0-9A-HJKMNP-TV-Z]{26}$")
+UNPROVISIONED_RE = re.compile(r"^RR-UNPROVISIONED-[0-9A-F]{16}$")
+
+# The RP2040 boot ROM's volume label, and the file every UF2 bootloader
+# publishes at its root. The marker is what actually identifies the drive - an
+# unrelated volume can share the label.
+BOOTSEL_VOLUME_NAME = "RPI-RP2"
+BOOTSEL_MARKER = "INFO_UF2.TXT"
 
 
 def crc8(data: bytes) -> int:
@@ -45,7 +67,9 @@ def build_frame(opcode: int, payload: bytes = b"") -> bytes:
     return body + bytes([crc8(body)])
 
 
-def send_admin(port: str, opcode: int, payload: bytes = b"", timeout: float = 2) -> tuple[int, bytes]:
+def send_admin(
+    port: str, opcode: int, payload: bytes = b"", timeout: float = 2
+) -> tuple[int, bytes]:
     frame = build_frame(opcode, payload)
     with serial.Serial(port, 115200, timeout=timeout) as dev:
         dev.reset_input_buffer()
@@ -168,21 +192,79 @@ def wait_for_disconnect(port: str, timeout: float = 5) -> None:
     time.sleep(1)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not os.path.exists(port):
+        # Not os.path.exists: a COM port is not a filesystem path on Windows,
+        # and a by-id symlink can outlive the device on Linux.
+        if port not in [device for device, _ in roadrunner_ports()]:
             return
         time.sleep(0.05)
     raise SystemExit(f"{port} did not disconnect within {timeout}s")
 
 
+def normalise_serial(value: str) -> str:
+    """Strip the RR- prefix so the exclusion list can be written either way."""
+    return value[3:] if value.startswith("RR-") else value
+
+
+def check_exclusions() -> None:
+    """Refuse to run on a malformed exclusion entry.
+
+    A typo in this list silently protects nothing, and every step in this
+    script is destructive. A well-formed entry that simply is not attached is
+    fine and only warned about - that is the ordinary "board is unplugged"
+    case, and it cannot be distinguished from a typo by absence alone, which
+    is exactly why the shape is checked instead.
+    """
+    for entry in EXCLUDED_SERIALS:
+        full = entry if entry.startswith("RR-") else f"RR-{entry}"
+        if not (PROVISIONED_RE.match(full) or UNPROVISIONED_RE.match(full)):
+            raise SystemExit(
+                f"excluded serial {entry!r} is not a valid Roadrunner serial "
+                f"({len(normalise_serial(entry))} characters; a provisioned "
+                f"serial has 26). Refusing to run: an unmatched exclusion "
+                f"protects nothing, and every step here reflashes the board."
+            )
+
+    attached = {
+        normalise_serial(s) for _, s in roadrunner_ports(apply_exclusions=False)
+    }
+    for entry in EXCLUDED_SERIALS:
+        if normalise_serial(entry) not in attached:
+            print(f"note: excluded board {entry} is not currently attached")
+
+
+def roadrunner_ports(apply_exclusions: bool = True) -> list[tuple[str, str]]:
+    """Every attached Roadrunner as (device, serial), minus the excluded ones.
+
+    Replaces the Linux-only /dev/serial/by-id glob: pyserial reports the USB
+    descriptor fields on every platform, and matching them directly avoids
+    depending on udev naming. It also sidesteps the by-id collision two
+    unprovisioned boards would cause - they share a flash UID, so they share a
+    serial, and only one symlink can exist.
+    """
+    found = []
+    for port in serial.tools.list_ports.comports():
+        if (port.manufacturer or "") != USB_MANUFACTURER:
+            continue
+        if (port.product or "") != USB_PRODUCT:
+            continue
+        number = port.serial_number or ""
+        if not number.startswith("RR-"):
+            continue
+        if apply_exclusions and normalise_serial(number) in {
+            normalise_serial(e) for e in EXCLUDED_SERIALS
+        }:
+            continue
+        found.append((port.device, number))
+    return sorted(found)
+
+
 def wait_for_serial_port(timeout: float = 10, settle: float = 0.3) -> str:
     """Wait for exactly one matching port, then confirm it stays put for
-    `settle` seconds before trusting it — right after a reset, udev can
-    briefly report a stale or about-to-change symlink."""
+    `settle` seconds before trusting it — right after a reset the OS can
+    briefly report a stale or about-to-change device."""
+
     def live_matches() -> list[str]:
-        # glob lists directory entries even for a symlink whose target is
-        # already gone (udev can lag in cleaning up after a reset); only
-        # trust entries that actually resolve.
-        return [m for m in glob.glob(PORT_GLOB) if os.path.exists(m)]
+        return [device for device, _ in roadrunner_ports()]
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -201,21 +283,61 @@ def wait_for_serial_port(timeout: float = 10, settle: float = 0.3) -> str:
             if stable:
                 return candidate
         time.sleep(0.1)
-    raise SystemExit(f"no Roadrunner serial port found matching {PORT_GLOB}")
+    raise SystemExit(
+        "no Roadrunner serial port found "
+        f"(manufacturer={USB_MANUFACTURER!r}, product={USB_PRODUCT!r}, "
+        f"serial starting RR-, excluding {len(EXCLUDED_SERIALS)} board(s))"
+    )
 
 
-def wait_for_bootsel_mount(timeout: float = 10) -> None:
+def bootsel_volume() -> Path | None:
+    """The mounted RP2040 boot ROM volume, or None.
+
+    Identified by INFO_UF2.TXT at the root rather than by volume label: an
+    unrelated drive can be labelled RPI-RP2, and on Windows the label is not
+    part of the path anyway. Searches drive letters on Windows and the usual
+    automount roots elsewhere.
+    """
+    if os.name == "nt":
+        roots = [Path(f"{letter}:/") for letter in string.ascii_uppercase]
+    else:
+        roots = [
+            Path(parent) / user / BOOTSEL_VOLUME_NAME
+            for parent in ("/media", "/run/media")
+            for user in _listdir(parent)
+        ]
+    for root in roots:
+        try:
+            if (root / BOOTSEL_MARKER).is_file():
+                return root
+        except OSError:
+            continue
+    return None
+
+
+def _listdir(path: str) -> list[str]:
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
+def wait_for_bootsel_mount(timeout: float = 10) -> Path:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.ismount(BOOTSEL_MOUNT):
-            if not os.access(BOOTSEL_MOUNT, os.W_OK):
+        volume = bootsel_volume()
+        if volume is not None:
+            if not os.access(volume, os.W_OK):
                 raise SystemExit(
-                    f"{BOOTSEL_MOUNT} is mounted but not writable by this user "
-                    f"(uid={os.getuid()}); check the automount's uid/gid options" # pyright: ignore[reportAttributeAccessIssue]
+                    f"{volume} is mounted but not writable by this user; "
+                    f"on Linux check the automount's uid/gid options"
                 )
-            return
+            return volume
         time.sleep(0.1)
-    raise SystemExit(f"{BOOTSEL_MOUNT} did not appear within {timeout}s")
+    raise SystemExit(
+        f"no {BOOTSEL_VOLUME_NAME} volume (a directory containing "
+        f"{BOOTSEL_MARKER}) appeared within {timeout}s"
+    )
 
 
 def picotool_info() -> None:
@@ -231,7 +353,7 @@ def flash_and_test(uf2: Path) -> None:
     print(f"=== {uf2.name} ===")
 
     wait_for_bootsel_mount()
-    shutil.copy(uf2, BOOTSEL_MOUNT / uf2.name)
+    shutil.copy(uf2, wait_for_bootsel_mount() / uf2.name)
 
     port = wait_for_serial_port()
     print(f"port: {port}")
@@ -274,7 +396,9 @@ def flash_and_test(uf2: Path) -> None:
             f"bad CLEAR_IDENTITY confirmation should not change identity, but "
             f"device is now {result['serial']!r} (provisioned={result['provisioned']})"
         )
-    print("bad CLEAR_IDENTITY confirmation correctly rejected (CONFIRMATION_REQUIRED), no reboot")
+    print(
+        "bad CLEAR_IDENTITY confirmation correctly rejected (CONFIRMATION_REQUIRED), no reboot"
+    )
 
     if "usbserial" in uf2.name:
         test_usbserial(port)
@@ -286,21 +410,30 @@ def flash_and_test(uf2: Path) -> None:
 
 
 def ensure_bootsel() -> None:
-    if os.path.ismount(BOOTSEL_MOUNT):
+    if bootsel_volume() is not None:
         return
 
-    matches = [m for m in glob.glob(PORT_GLOB) if os.path.exists(m)]
+    matches = roadrunner_ports()
     if len(matches) > 1:
-        raise SystemExit(f"multiple Roadrunner serial ports found: {matches}")
+        # Refuse rather than pick. Every step after this reflashes whatever it
+        # chose, so an ambiguous bus is not something to resolve by guessing.
+        listing = ", ".join(f"{device} ({number})" for device, number in matches)
+        raise SystemExit(
+            f"multiple Roadrunner boards attached after exclusions: {listing}. "
+            f"Unplug all but the bench board, or add the others to "
+            f"EXCLUDED_SERIALS."
+        )
     if len(matches) == 1:
-        print(f"device in application mode on {matches[0]}, rebooting to BOOTSEL")
-        reboot_bootsel(matches[0])
+        device, number = matches[0]
+        print(f"device in application mode on {device} ({number}), rebooting to BOOTSEL")
+        reboot_bootsel(device)
         wait_for_bootsel_mount()
         return
 
     raise SystemExit(
-        f"no device found in BOOTSEL ({BOOTSEL_MOUNT}) or application mode "
-        f"({PORT_GLOB}); connect the board and put it in BOOTSEL"
+        f"no device found in BOOTSEL (no directory containing "
+        f"{BOOTSEL_MARKER}) or in application mode; connect the bench board "
+        f"and put it in BOOTSEL"
     )
 
 
@@ -309,6 +442,7 @@ def main() -> None:
     if not uf2_files:
         raise SystemExit("no .uf2 files found in current directory")
 
+    check_exclusions()
     ensure_bootsel()
 
     for uf2 in uf2_files:
