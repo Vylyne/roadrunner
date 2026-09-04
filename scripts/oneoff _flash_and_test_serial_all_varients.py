@@ -162,30 +162,93 @@ def reboot_bootsel(port: str) -> None:
         raise SystemExit(f"REBOOT_BOOTSEL failed with status {status:#04x}")
 
 
-def test_usbserial(port: str) -> None:
+def read_register(port: str, reg: int, size: int, timeout: float = 2) -> bytes:
+    """One legacy 0xf5-framed register read, returning just the payload.
+
+    The reply is 0x05 0xff <reg> followed by `size` bytes. `size` has to be
+    supplied because the framing carries no length - the caller and the
+    firmware have to agree, which is why the register table is documented.
+    """
     with serial.Serial(port, 115200, timeout=0.2) as dev:
         dev.reset_input_buffer()
-        dev.write(bytes([0xF5, 0x10]))
+        dev.write(bytes([0xF5, reg]))
         dev.flush()
 
+        header = bytes([0x05, 0xFF, reg])
         received = bytearray()
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             received.extend(dev.read(dev.in_waiting or 1))
-            marker = received.find(b"\x05\xff\x10")
-            if marker >= 0 and len(received) >= marker + 13:
-                frame = received[marker : marker + 13]
-                magnet, filament, turns, angle = struct.unpack("<BBll", frame[3:])
-                print("frame:   ", frame.hex(" "))
-                print(
-                    f"magnet={magnet} filament={filament} turns={turns} angle={angle}"
-                )
-                if magnet == 0xFF:
-                    raise SystemExit(
-                        "sensor replied, but AS5600 magnet state is unknown"
-                    )
-                return
-        raise SystemExit(f"no complete legacy reply; received: {received.hex(' ')}")
+            marker = received.find(header)
+            if marker >= 0 and len(received) >= marker + 3 + size:
+                return bytes(received[marker + 3 : marker + 3 + size])
+    raise SystemExit(
+        f"no complete reply for register {reg:#04x}; received: {received.hex(' ')}"
+    )
+
+
+def test_usbserial_locked(port: str) -> None:
+    """A board with no valid identity must refuse sensor data but still answer.
+
+    This is the one behaviour on the identity-gate branch that no host test can
+    reach: the firmware answers with the register's own length filled with
+    0xff, rather than going silent. Silence would be indistinguishable from a
+    wiring fault, so "it replied, and the reply is refusal-shaped" is the
+    assertion that matters.
+    """
+    payload = read_register(port, 0x10, 10)
+    print("locked READ_ALL:  ", payload.hex(" "))
+    if payload != b"\xff" * 10:
+        raise SystemExit(
+            f"expected ten 0xff bytes from a board with no valid identity, got "
+            f"{payload.hex(' ')} - the register gate is not refusing"
+        )
+
+    # The identity window must stay readable while everything else is refused;
+    # it is both the allow-list and the diagnostic that explains the refusal.
+    state = read_register(port, 0x30, 1)
+    if state[0] != 0x00:
+        raise SystemExit(
+            f"READ_IDENTITY_STATE reported {state[0]:#04x} on a board that "
+            f"should have no identity (expected 0x00 / RR_IDENTITY_NONE)"
+        )
+
+    serial_bytes = read_register(port, 0x31, 34)
+    reported = serial_bytes.split(b"\x00", 1)[0].decode("ascii", "replace")
+    print("locked serial:    ", reported)
+    if not UNPROVISIONED_RE.match(reported):
+        raise SystemExit(
+            f"READ_SERIAL returned {reported!r}, which is not an unprovisioned "
+            f"Roadrunner serial"
+        )
+    print("gate holds: sensor registers refused, identity window readable")
+
+
+def test_usbserial(port: str) -> None:
+    payload = read_register(port, 0x10, 10)
+    magnet, filament, turns, angle = struct.unpack("<BBll", payload)
+    print("frame:   ", (b"\x05\xff\x10" + payload).hex(" "))
+    print(f"magnet={magnet} filament={filament} turns={turns} angle={angle}")
+
+    # 0xff means two very different things now, and conflating them sends
+    # somebody hunting a wiring fault that does not exist. A locked board fills
+    # every sensor register with 0xff; a provisioned board with no magnet
+    # attached reports MAGNET_STATE_UNKNOWN (0). Ask the identity register
+    # which case this is rather than guessing from the sensor value.
+    if magnet == 0xFF:
+        state = read_register(port, 0x30, 1)
+        if state[0] != 0x01:
+            raise SystemExit(
+                f"sensor registers are refused: the board has no valid identity "
+                f"(READ_IDENTITY_STATE = {state[0]:#04x}). This is the gate "
+                f"working, not a sensor fault - provision the board first."
+            )
+        raise SystemExit(
+            "board is provisioned and the gate is open, but AS5600 magnet state "
+            "reads 0xff - a genuine sensor fault"
+        )
+    if magnet == 0x00:
+        print("note: magnet state is UNKNOWN - expected on a bare board with no AS5600")
 
 
 def wait_for_disconnect(port: str, timeout: float = 5) -> None:
@@ -372,6 +435,12 @@ def flash_and_test(uf2: Path) -> None:
                 f"as {result['serial']} after reset"
             )
         print("cleared existing identity")
+
+    # The board has no valid identity at exactly this point, and only here.
+    # Everything after provisioning tests an open gate, so this is the one
+    # window in the run where the refusal behaviour is observable at all.
+    if "usbserial" in uf2.name:
+        test_usbserial_locked(port)
 
     new_serial = provision_uuid(port)
     wait_for_disconnect(port)  # PROVISION_UUID resets and re-enumerates
