@@ -151,6 +151,18 @@ the steady-state identity source. Field order and encoding mirror the USB
 what a Roadrunner's identity is, with `INFO` and this window as two
 encodings of it.
 
+**A UART host can only read the two short registers.** Klipper's MCU-side
+`tmcuart` buffer is ten bytes (`uint8_t data[10]` in `klipper/src/tmcuart.c`),
+and a request for more is `shutdown("tmcuart data too large")` — an MCU
+shutdown, not a failed read. The bit-banged read asks for
+`(((4 + reg_length) * 10) + 7) // 8` bytes, which reaches exactly ten at a
+four-byte register, so four bytes is a hard ceiling on that transport.
+`READ_IDENTITY_STATE` (1) and `READ_VARIANT` (2) fit; `READ_SERIAL` (34),
+`READ_FIRMWARE_VERSION` (32) and `READ_FLASH_UID` (8) do not, and a host must
+not attempt them over UART. Serving them there would need the firmware to
+offer the window in four-byte chunks, which it does not. I2C and usbserial
+carry the whole window.
+
 **The identity register window is read-only in this release.** There is no
 write path on I2C or UART: `i2c_target.c` reads and discards every byte after
 the register address, and the UART transport is request/response only. A

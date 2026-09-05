@@ -21,6 +21,8 @@
 - [x] Persistent provisioned device identities with safe USB diagnostics
 - [x] Direct USB maintenance and ROM BOOTSEL recovery
 - [x] A board without a valid identity refuses to serve sensor data
+- [x] Board identity, firmware version and variant in the Klipper printer
+  object, for host tools to map a sensor to its USB device
 
 Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
 UF2 update preserves the identity record; the direct-USB `CLEAR_IDENTITY`
@@ -57,6 +59,12 @@ extra's on-connect path — every route above ultimately goes over USB.
 
 - [ ] Add GitHub Actions firmware build and release artifacts, plus repeatable
   protocol validation on a bench board.
+- [ ] Make a UART-wired board identifiable from the printer object. Klipper's
+  ten-byte `tmcuart` buffer caps that transport at four-byte registers, so
+  `identity.serial` and `identity.firmware_version` are null there and a host
+  tool cannot tell one UART board from another. Closing it needs either the
+  firmware to serve the identity window in four-byte chunks, or the extra's
+  planned on-connect USB admin path.
 
 Most 3D printer motion sensors are bulky, slow to trigger, prone to false positives, and have a high detection distance meaning a large amount material is extruded before actually detecting a runout, leading to poor layer adhesion and failed prints after a runout.
 
@@ -163,6 +171,54 @@ pause_on_runout: False
 runout_gcode: RESPOND TYPE=command MSG='Filament switch sensor detected filament is no longer present'
 event_delay: 0.1
 ```
+
+##### Board identity in the printer object
+
+The extra reads the board's identity register window once, when the board
+first answers, and reports it in the printer object. It is static between
+reboots, so it is not re-read on every poll; the extra asks again when a
+sensor that had gone away comes back, since the board that returned is not
+necessarily the board that left.
+
+```
+"identity": {
+    "provisioned": true,
+    "state": "ok",             # none / ok / conflict / io error / unknown
+    "serial": "RR-...",
+    "firmware_version": "...",
+    "transport": "usb",        # i2c / uart / usb, as built into the firmware
+    "led_order": "grb"         # rgb / grb
+},
+"connection": {
+    "port": "/dev/serial/by-id/...",   # as configured, usbserial only
+    "device_path": "/dev/ttyACM0",     # what that resolves to
+    "reads_ok": 1234,
+    "reads_failed": 0,
+    "consecutive_failures": 0
+}
+```
+
+A host tool matches `identity.serial` against the USB serial descriptor of an
+attached board, and `connection.device_path` against the port it enumerated
+at. The keys are always present: before the first successful read the values
+are `null` and the state is `"unknown"`, so a subscriber never sees a key
+appear late.
+
+`state` is the authoritative explanation for a board that answers but reports
+no sensor data. An unprovisioned board fills every sensor register with `0xFF`
+rather than going quiet, so without this field a refusing board and a dead one
+look the same; the extra logs and reports the reason instead, and points at
+`scripts/roadrunner_admin.py`.
+
+**On a UART-wired board, `serial` and `firmware_version` are always `null`.**
+Klipper's MCU-side `tmcuart` buffer holds ten bytes, and asking for more is an
+MCU shutdown rather than a failed read, which caps this transport at four-byte
+registers. `state` and the variant fields fit; the two strings do not. I2C and
+usbserial report everything.
+
+The flash UID (register `0x34`) is deliberately not reported: the protocol
+document says hosts must not persist it, and anything in the printer object is
+persisted. `scripts/roadrunner_admin.py` reads it for diagnostics instead.
 
 
 ## Usage

@@ -3,6 +3,7 @@
 # Copyright (C) 2023 Francois Chagnon <fc@francoischagnon.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import os
 import struct
 import logging
 import typing
@@ -14,6 +15,11 @@ DEFAULT_I2C_TARGET_ADDR = 0x40
 DEFAULT_I2C_SPEED = 100000
 
 CHECK_RUNOUT_TIMEOUT = .100 # read sensor value at this interval
+
+# Seconds between attempts to read the identity window while the read is
+# failing. Identity is static between reboots, so the successful read happens
+# once; this only paces the retries.
+IDENTITY_RETRY_TIMEOUT = 10.
 
 VIRTUAL_MOTION_PREFIX = 'virtual_motion_sensor'
 VIRTUAL_SWITCH_PREFIX = 'virtual_switch_sensor'
@@ -40,6 +46,122 @@ class MagnetState:
 
     def __repr__(self):
         return "%s(value=%s)" % (self.__class__.__name__, repr(self.value))
+
+class IdentityState:
+    """ Result of the board's identity load, register 0x30.
+
+    Any value other than OK means the board refuses to serve sensor data - see
+    docs/roadrunner-identity-gate-design.md. ALREADY_PROVISIONED is part of the
+    enum but is only ever returned by a provisioning attempt, so it is decoded
+    here and not acted on. """
+    NONE = 0
+    OK = 1
+    CONFLICT = 2
+    ALREADY_PROVISIONED = 3
+    IO_ERROR = 4
+
+    VALUES : dict[int, str] = {
+        NONE: "none",
+        OK: "ok",
+        CONFLICT: "conflict",
+        ALREADY_PROVISIONED: "already provisioned",
+        IO_ERROR: "io error",
+    }
+
+    def __init__(self, value : typing.Optional[int]):
+        self.value = value
+
+    def __str__(self):
+        return IdentityState.VALUES.get(self.value, "unknown")
+
+    def __repr__(self):
+        return "%s(value=%s)" % (self.__class__.__name__, repr(self.value))
+
+class IdentityRegister:
+    """ Enum of registers carrying the board's identity.
+
+    These are readable whether or not the board is provisioned: they are both
+    the unprovisioned allow-list and the steady-state identity source, and one
+    definition serves both.
+
+    0x34 READ_FLASH_UID is deliberately absent. The protocol document says
+    hosts must not persist it, and anything reported by get_status() is
+    persisted - Moonraker caches printer objects and writes them to its logs.
+    The admin script reads it for diagnostics instead. """
+    STATE = 0x30
+    SERIAL = 0x31
+    FIRMWARE_VERSION = 0x32
+    VARIANT = 0x33
+
+    # The firmware does not carry a length in its reply, so these are the
+    # caller's half of an agreement with it. Source of truth is the register
+    # table in docs/roadrunner-usb-admin-protocol.md.
+    SIZES : dict[int, int] = {
+        STATE: 1,
+        SERIAL: 34,
+        FIRMWARE_VERSION: 32,
+        VARIANT: 2,
+    }
+
+TRANSPORT_NAMES : dict[int, str] = {1: "i2c", 2: "uart", 3: "usb"}
+LED_ORDER_NAMES : dict[int, str] = {1: "rgb", 2: "grb"}
+
+def decode_identity_string(data : typing.Optional[bytearray]) -> typing.Optional[str]:
+    """ Decode a NUL-padded ASCII identity register.
+
+    Replaces undecodable bytes rather than raising: this ends up in
+    get_status(), and a garbled read must not take the status query down with
+    it. """
+    if not data:
+        return None
+    return bytes(data).split(b"\x00", 1)[0].decode("ascii", errors="replace")
+
+class SensorIdentity:
+    """ Which board this is, read from the identity register window.
+
+    Static between reboots, so it is read once and cached. `state` is the
+    anchor: it is the authoritative explanation for a board that answers but
+    refuses to report sensor data. The remaining fields are best-effort,
+    because not every transport can carry them - see RegisterReaderUART. """
+
+    def __init__(self, state : typing.Optional[int], serial : typing.Optional[str] = None,
+                 firmware_version : typing.Optional[str] = None,
+                 transport : typing.Optional[int] = None,
+                 led_order : typing.Optional[int] = None):
+        self.state = IdentityState(state)
+        self.serial = serial
+        self.firmware_version = firmware_version
+        self.transport = transport
+        self.led_order = led_order
+
+    @property
+    def provisioned(self) -> bool:
+        return self.state.value == IdentityState.OK
+
+    def __repr__(self):
+        return "%s(state=%s, serial=%s, firmware_version=%s)" % (
+            self.__class__.__name__, str(self.state), repr(self.serial),
+            repr(self.firmware_version))
+
+    def get_status(self):
+        """ JSON-safe, and the same keys whether or not a field was readable. """
+        return {
+            "provisioned": self.provisioned,
+            "state": str(self.state),
+            "serial": self.serial,
+            "firmware_version": self.firmware_version,
+            "transport": TRANSPORT_NAMES.get(self.transport),
+            "led_order": LED_ORDER_NAMES.get(self.led_order),
+        }
+
+    @staticmethod
+    def unknown_status():
+        """ The same shape with nothing filled in, for before the first read.
+
+        Built from an instance rather than written out again, so the two can
+        not drift apart: a Moonraker subscriber keys off the shape of the
+        object and a key that appears late is a key it never sees. """
+        return SensorIdentity(None).get_status()
 
 class SensorRegister:
     """ Enum of registers that can be read from the sensor. """
@@ -121,12 +243,98 @@ class SensorUART(tmc_uart.MCU_TMC_uart_bitbang):
         return self._decode_read(reg, params['read'])
 
 class RegisterReaderGeneric:
+    # The identity registers this transport can carry. Every transport can
+    # read the whole window unless it says otherwise, and one cannot.
+    identity_registers = (IdentityRegister.STATE, IdentityRegister.SERIAL,
+                          IdentityRegister.FIRMWARE_VERSION, IdentityRegister.VARIANT)
+
     def __init__(self): pass
     def read(self) -> SensorRegister: raise NotImplementedError('must be implemented in subclass')
+    def read_reg(self, reg : int, length : int) -> typing.Optional[bytearray]:
+        raise NotImplementedError('must be implemented in subclass')
+
+    def decode_all(self, data : typing.Optional[bytearray]) -> typing.Optional[SensorRegister]:
+        """ Decode a READ_ALL payload, shared by the transports that read it
+        in one go. """
+        if not data or len(data) != 10:
+            if data:
+                error = "expected 10 bytes but got %d: '%s'" % (len(data), data.hex(), )
+            else:
+                error = "communication error"
+            logging.warning(f"Reading from sensor failed: {error}")
+            return
+
+        magnet_state, filament_presence, full_turns, angle = struct.unpack('<BBll', data)
+        if magnet_state == 0xff:
+            # A board with no valid identity answers every sensor register
+            # with 0xff rather than going quiet. Nothing here is real, so
+            # report nothing; the sensor consults the identity window for the
+            # reason and says so.
+            return
+
+        return SensorRegister(magnet_state, filament_presence, full_turns, angle)
+
+    def read_identity(self) -> typing.Optional[SensorIdentity]:
+        """ Read the identity window, or None when the board did not answer.
+
+        STATE is the anchor: without it there is nothing to report and the
+        caller should try again later. The rest is best-effort - a transport
+        that cannot carry a field leaves it None rather than throwing away the
+        state it did manage to read. """
+        state = self.read_reg(IdentityRegister.STATE,
+                              IdentityRegister.SIZES[IdentityRegister.STATE])
+        if not state:
+            return None
+
+        fields = {}
+        for reg in self.identity_registers:
+            if reg != IdentityRegister.STATE:
+                fields[reg] = self.read_reg(reg, IdentityRegister.SIZES[reg])
+
+        variant = fields.get(IdentityRegister.VARIANT)
+        if variant is not None and len(variant) != IdentityRegister.SIZES[IdentityRegister.VARIANT]:
+            variant = None
+
+        return SensorIdentity(
+            state[0],
+            serial=decode_identity_string(fields.get(IdentityRegister.SERIAL)),
+            firmware_version=decode_identity_string(fields.get(IdentityRegister.FIRMWARE_VERSION)),
+            transport=variant[0] if variant else None,
+            led_order=variant[1] if variant else None,
+        )
 
 class RegisterReaderUART(RegisterReaderGeneric):
+    # Klipper's MCU-side tmcuart buffer is ten bytes (`uint8_t data[10]` in
+    # klipper/src/tmcuart.c), and asking for more is not a failed read - it is
+    # `shutdown("tmcuart data too large")`, which takes the printer down.
+    # reg_read() below asks the MCU for (((4 + reg_length) * 10) + 7) // 8
+    # bytes, which reaches exactly 10 at a 4-byte register, so four bytes is a
+    # hard ceiling on this transport.
+    #
+    # That leaves STATE (1) and VARIANT (2) readable. SERIAL (34) and
+    # FIRMWARE_VERSION (32) are not, and are reported as None rather than
+    # attempted: reading them here would require the firmware to offer the
+    # window in four-byte chunks, which it does not.
+    MAX_REGISTER_LENGTH = 4
+    identity_registers = (IdentityRegister.STATE, IdentityRegister.VARIANT)
+
     def __init__(self, uart):
         self.uart = uart
+
+    def read_reg(self, reg, length):
+        if length > self.MAX_REGISTER_LENGTH:
+            logging.warning(
+                "Not reading register %02x over uart: it is %d bytes and "
+                "Klipper's tmcuart buffer holds %d, which would shut down the "
+                "MCU rather than fail the read."
+                % (reg, length, self.MAX_REGISTER_LENGTH))
+            return
+        data = self.uart_read_reg(reg, length)
+        if data is not None and len(data) != length:
+            logging.warning("Register %02x returned %d bytes, expected %d"
+                            % (reg, len(data), length))
+            return
+        return data
 
     def read(self):
         magnet_state = self.uart_read_reg1(SensorRegister.MAGNET_STATE)
@@ -163,20 +371,15 @@ class RegisterReaderI2C(RegisterReaderGeneric):
         self.sensor_name = sensor_name
 
     def read(self):
-        data = self.i2c_read_reg(SensorRegister.ALL, 10)
-        if not data or len(data) != 10:
-            if data:
-                error = "expected 10 bytes but got %d: '%s'" % (len(data), data.hex(), )
-            else:
-                error = "communication error"
-            logging.warning(f"Reading from sensor failed: {error}")
-            return
+        return self.decode_all(self.i2c_read_reg(SensorRegister.ALL, 10))
 
-        magnet_state, filament_presence, full_turns, angle = struct.unpack('<BBll', data)
-        if magnet_state == 0xff:
+    def read_reg(self, reg, length):
+        data = self.i2c_read_reg(reg, length)
+        if data is not None and len(data) != length:
+            logging.warning("Register %02x returned %d bytes, expected %d"
+                            % (reg, len(data), length))
             return
-
-        return SensorRegister(magnet_state, filament_presence, full_turns, angle)
+        return data
 
     def i2c_read_reg(self, reg, length):
         try:
@@ -197,8 +400,17 @@ class RegisterReaderSerial(RegisterReaderGeneric):
         self.buffer = bytes()
 
     def read(self):
+        return self.decode_all(self.read_reg(SensorRegister.ALL, 10))
+
+    def read_reg(self, reg, length):
+        """ Request one register and return its payload.
+
+        The framing does not carry a length: the reply is 0x05 0xff <reg>
+        followed by however many bytes the firmware decided the register is,
+        so caller and firmware have to agree in advance. That agreement is
+        IdentityRegister.SIZES and the register table it points at. """
         try:
-            if self.serial.write(bytearray([0xf5, SensorRegister.ALL])) != 2:
+            if self.serial.write(bytearray([0xf5, reg])) != 2:
                 logging.warning(f"Writing to serial failed")
                 return
 
@@ -219,34 +431,23 @@ class RegisterReaderSerial(RegisterReaderGeneric):
                 self.buffer = bytes()
                 return
 
-            if len(self.buffer) < 13:
+            # Counted from the marker, not from the start of the buffer:
+            # anything before the marker is not part of this response.
+            if len(self.buffer) < marker + 3 + length:
                 logging.warning(f"Not enough bytes read for response")
                 return
 
-            if (r := self.buffer[marker+2]) != SensorRegister.ALL:
+            if (r := self.buffer[marker+2]) != reg:
                 logging.warning(f"Wrong register response ({r!r})")
                 self.buffer = self.buffer[marker+1:]
                 return
 
-            data = self.buffer[marker+3:marker+13]
-            self.buffer = self.buffer[marker+13:]
+            data = self.buffer[marker+3:marker+3+length]
+            self.buffer = self.buffer[marker+3+length:]
+            return bytearray(data)
         except serial.SerialException:
             logging.error("Unable to communicate with sensor")
             return
-
-        if not data or len(data) != 10:
-            if data:
-                error = "expected 10 bytes but got %d: '%s'" % (len(data), data.hex(), )
-            else:
-                error = "communication error"
-            logging.warning(f"Reading from sensor failed: {error}")
-            return
-
-        magnet_state, filament_presence, full_turns, angle = struct.unpack('<BBll', data)
-        if magnet_state == 0xff:
-            return
-
-        return SensorRegister(magnet_state, filament_presence, full_turns, angle)
 
 class SensorRotationHelper:
     """ Helper class used to convert raw point-in-time readings from the sensor
@@ -580,6 +781,14 @@ class HighResolutionFilamentSensor:
         self.setup_buttons(VIRTUAL_MOTION_PREFIX, VirtualMotionWrapper)
         self.setup_buttons(VIRTUAL_SWITCH_PREFIX, VirtualSwitchWrapper)
 
+        # Board identity, read from the sensor once it answers
+        self._identity : typing.Optional[SensorIdentity] = None
+        self._identity_next_attempt = 0.
+        self._device_path : typing.Optional[str] = None
+        self._reads_ok = 0
+        self._reads_failed = 0
+        self._consecutive_failures = 0
+
         # Internal sensor state
         self._magnet_state = MagnetState(0xff)
         self._sensor_connected = TriggerOnChange(None, self._sensor_connected_changed)
@@ -604,6 +813,15 @@ class HighResolutionFilamentSensor:
         underextruding_detected = "detected" if self._underextruding else "not detected"
         msg = f"Filament Sensor {self.name}:\n"
         msg += f"- sensor {sensor_connected}\n"
+        if self._identity is None:
+            msg += "- identity not read yet\n"
+        else:
+            msg += f"- identity {self._identity.state}"
+            if self._identity.serial:
+                msg += f", serial {self._identity.serial}"
+            if self._identity.firmware_version:
+                msg += f", firmware {self._identity.firmware_version}"
+            msg += "\n"
         msg += f"- filament {filament_present}\n"
         msg += f"- runout {runout_detected}\n"
         msg += f"- underextrusion {underextruding_detected}\n"
@@ -618,6 +836,10 @@ class HighResolutionFilamentSensor:
             if self.serial_port:
                 ser = serial.Serial(self.serial_port, self.baud, timeout=0.05, write_timeout=0.05)
                 self.regs = RegisterReaderSerial(ser)
+                # Resolved once, here, because the configured path is usually a
+                # /dev/serial/by-id symlink and what a host tool matches against
+                # is the device it points at.
+                self._device_path = os.path.realpath(self.serial_port)
         except serial.SerialException:
             raise self.printer.config_error(f"{self.name}: Could not connect to {self.serial_port}")
 
@@ -697,9 +919,24 @@ class HighResolutionFilamentSensor:
         move = self._status_evaluation_move
         speed = move.speed if move and not move.ended else None
 
+        identity = self._identity.get_status() if self._identity \
+            else SensorIdentity.unknown_status()
+
         return {
             "enabled": bool(self.runout_helper.sensor_enabled),
             "sensor_connected": bool(self._sensor_connected),
+            # Which board this is, and where it is attached. A host tool
+            # matches `identity.serial` against a USB device's serial
+            # descriptor, and `connection.device_path` against the port it
+            # enumerated at.
+            "identity": identity,
+            "connection": {
+                "port": self.serial_port,
+                "device_path": self._device_path,
+                "reads_ok": self._reads_ok,
+                "reads_failed": self._reads_failed,
+                "consecutive_failures": self._consecutive_failures,
+            },
             "magnet_state": str(self._magnet_state),
             "filament_detected": bool(self._filament_present),
             # "debug": {
@@ -756,6 +993,12 @@ class HighResolutionFilamentSensor:
         if old_value is None:
             return
         if new_value:
+            # The board that came back is not necessarily the board that went
+            # away - it may have been swapped, reflashed or provisioned while
+            # it was gone. Drop the cached identity and ask again.
+            self._identity = None
+            self._identity_next_attempt = 0.
+        if new_value:
             self._respond_info("Reconnected")
         else:
             self._respond_error("No longer connected or data cannot be read")
@@ -773,13 +1016,57 @@ class HighResolutionFilamentSensor:
         else:
             self._respond_error("Filament not present")
 
+    def _update_identity(self, eventtime):
+        """ Read the board's identity, once, and cache it.
+
+        Identity does not change between reboots, so this has no business in
+        the 100ms sensor poll: over I2C the serial register alone is 34
+        RD_REQ events with the bus clock-stretching, and over UART it is
+        bit-banged. Read it when the board first answers, keep it, and retry
+        on a slow timer for as long as the read fails.
+
+        Failure here is never fatal. A board that will not say who it is still
+        reports filament, and taking Klippy down over a blank status field
+        would be a far worse outcome than the blank field. """
+        if self._identity is not None or eventtime < self._identity_next_attempt:
+            return
+
+        self._identity_next_attempt = eventtime + IDENTITY_RETRY_TIMEOUT
+        try:
+            identity = self.regs.read_identity()
+        except Exception:
+            logging.exception(f"{self.name}: reading the identity registers failed")
+            return
+
+        if identity is None:
+            return
+
+        self._identity = identity
+        logging.info(f"{self.name}: identity {identity!r}")
+
+        if not identity.provisioned:
+            # The one thing this whole window exists to make sayable: the
+            # board is answering, and it is refusing on purpose.
+            self._respond_error(
+                f"board is not provisioned (identity {identity.state}), so it "
+                f"refuses to report sensor data. Provision it with "
+                f"scripts/roadrunner_admin.py over USB.")
+
     def _update_state_from_sensor(self):
         """ Read data from sensor and sets the internal state to match. """
 
         eventtime = self.reactor.monotonic()
         self._inspect_commanded_move(eventtime)
 
+        self._update_identity(eventtime)
+
         regs = self.regs.read()
+        if regs and regs.connected:
+            self._reads_ok += 1
+            self._consecutive_failures = 0
+        else:
+            self._reads_failed += 1
+            self._consecutive_failures += 1
         self._sensor_connected.set(bool(regs and regs.connected), eventtime)
         if not self._sensor_connected:
             return
