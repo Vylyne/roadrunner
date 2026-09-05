@@ -6,18 +6,13 @@ hands-on counterpart to `oneoff_flash_and_test.py`: that script drives a fixed
 destructive sequence across every UF2 in a directory, this one does one thing
 at a time to one board you name.
 
-The two halves of the tool have deliberately different safety rules:
-
-  * Read-only commands (`list`, `info`, `identity`, `read`, `dump`) see every
-    attached board, including the ones on `EXCLUDED_SERIALS`.  Asking a
-    board in a printer what it is must always work - that is the single most
-    useful thing this tool does, and refusing it would be safety theatre.
-
-  * Commands that write or reset (`provision`, `clear`, `bootsel`, `flash`)
-    refuse the excluded boards, warn that the board is about to reset, and
-    ask for confirmation.  A reset drops whatever Klipper connection the
-    board is serving, and on the I2C and UART variants that connection is
-    invisible from here - there is no serial lock to trip over.
+Every command acts on one board you named, or on the only one attached, so
+there is no exclusion list here: the bulk script needs one because it walks
+whatever it finds, and this tool never does.  What stands in for it is the
+confirmation on `provision`, `clear`, `bootsel` and `flash` - a reset drops
+whatever Klipper connection the board is serving, and on the I2C and UART
+variants that connection is invisible from here, because there is no serial
+lock to trip over.
 
 Register and opcode values follow docs/roadrunner-identity-gate-design.md.
 """
@@ -72,18 +67,11 @@ IDENTITY_OK = 0x01
 TRANSPORT_NAMES = {1: "i2c", 2: "uart", 3: "usbserial"}
 LED_ORDER_NAMES = {1: "RGB", 2: "GRB"}
 
-# Boards the destructive commands must never touch.  Kept in step with
-# oneoff_flash_and_test.py by hand; both files are edited when a board moves
-# into or out of a printer.  Entries are the serial as reported over USB, with
-# or without the "RR-" prefix.
-EXCLUDED_SERIALS = ()
-
 USB_MANUFACTURER = "Vylyne"
 USB_PRODUCT = "Roadrunner"
 
-# A provisioned serial is RR- plus 26 Crockford base32 characters (no I/L/O/U);
-# an unprovisioned one is RR-UNPROVISIONED- plus the 16-hex flash UID.
-PROVISIONED_RE = re.compile(r"^RR-[0-9A-HJKMNP-TV-Z]{26}$")
+# An unprovisioned serial is RR-UNPROVISIONED- plus the 16-hex flash UID; a
+# provisioned one is RR- plus 26 Crockford base32 characters.
 UNPROVISIONED_RE = re.compile(r"^RR-UNPROVISIONED-[0-9A-F]{16}$")
 
 # Placeholder serial for an explicit --port that USB discovery cannot see.
@@ -119,7 +107,6 @@ EXIT_NO_BOARD = 3
 EXIT_AMBIGUOUS = 4
 EXIT_REFUSED = 5
 EXIT_PROTOCOL = 6
-EXIT_EXCLUDED = 7
 
 
 class RoadrunnerError(Exception):
@@ -149,10 +136,6 @@ class RefusedError(RoadrunnerError):
     """The firmware answered, and the answer was no."""
 
     exit_code = EXIT_REFUSED
-
-
-class ExcludedError(RoadrunnerError):
-    exit_code = EXIT_EXCLUDED
 
 
 # --------------------------------------------------------------------------
@@ -351,27 +334,6 @@ def roadrunner_ports() -> list[tuple[str, str]]:
     return sorted(found)
 
 
-def check_exclusions() -> None:
-    """Refuse to run a destructive command on a malformed exclusion entry.
-
-    A typo here silently protects nothing.  The shape is what gets checked,
-    because absence cannot distinguish a typo from an unplugged board.
-    """
-    for entry in EXCLUDED_SERIALS:
-        full = entry if entry.startswith("RR-") else f"RR-{entry}"
-        if not (PROVISIONED_RE.match(full) or UNPROVISIONED_RE.match(full)):
-            raise ExcludedError(
-                f"excluded serial {entry!r} is not a valid Roadrunner serial "
-                f"({len(normalise_serial(entry))} characters; a provisioned "
-                f"serial has 26). Refusing to run a destructive command: an "
-                f"unmatched exclusion protects nothing."
-            )
-
-
-def is_excluded(number: str) -> bool:
-    return normalise_serial(number) in {normalise_serial(e) for e in EXCLUDED_SERIALS}
-
-
 def select_port(args) -> tuple[str, str]:
     """Resolve --port / --serial / sole attached board to (device, serial).
 
@@ -419,26 +381,15 @@ def select_port(args) -> tuple[str, str]:
 
 
 def guard_destructive(device: str, number: str, args) -> str:
-    """Everything that stands between a command and a board it may reset.
+    """Name the board out loud, then ask before resetting it.
 
-    Returns the serial it actually confirmed.  `select_port` honours an
-    explicit --port it cannot see in discovery, which would otherwise walk
-    straight past the exclusion list with an unknown serial - so if the serial
-    is unknown, ask the board itself before touching it.
+    Returns the serial it confirmed.  `select_port` honours an explicit --port
+    that discovery cannot see, which would otherwise put an unnamed board in
+    the confirmation prompt - so if the serial is unknown, ask the board.
     """
-    check_exclusions()
-
     if number == UNKNOWN_SERIAL:
         number = info(device)["serial"]
         print(f"{device} identifies as {number}")
-
-    if is_excluded(number):
-        if not getattr(args, "allow_excluded", False):
-            raise ExcludedError(
-                f"{number} is on EXCLUDED_SERIALS - it is installed in a printer. "
-                f"Pass --allow-excluded if you are certain."
-            )
-        print(f"warning: overriding the exclusion on {number}")
 
     print(
         f"\nThis resets {number} on {device}.\n"
@@ -470,21 +421,40 @@ def wait_for_disconnect(port: str, timeout: float = 5) -> None:
 
 
 def wait_for_serial_port(
-    known_before: set[str] | None = None, timeout: float = 10, settle: float = 0.3
+    known_before: set[str] | None = None,
+    prefix: str | None = None,
+    timeout: float = 10,
+    settle: float = 0.3,
+    expect_disconnect: bool = False,
 ) -> str:
     """Wait for a board to come back after a reset.
 
-    `known_before` is the set of devices that were already present and are not
-    the one being waited for; a new port outside that set is the one that just
+    With a USB port `prefix` the wait is for that port specifically, which is
+    exact: a board plugged in elsewhere while we waited cannot be mistaken for
+    ours.  Without one - Windows, or a host with no /dev/serial/by-path - it
+    falls back to `known_before`, the devices present beforehand that are not
+    the board we reset; a port outside that set is the one that just
     re-enumerated.  Right after a reset the OS can briefly report a stale
     device, so a candidate has to hold still for `settle` seconds.
+
+    `expect_disconnect` says the board is mid-reboot and has not gone away
+    yet. Without it, a port still listed from the previous enumeration looks
+    like a match, holds still for `settle` because udev has not removed it
+    yet, and gets returned - and then the caller opens a handle that vanishes
+    underneath it. Waiting for the port to go before waiting for it to come
+    back is the difference.
     """
     known_before = known_before or set()
 
     def candidates() -> list[str]:
+        if prefix is not None:
+            return [d for d, _ in roadrunner_ports() if port_topology(d) == prefix]
         return [d for d, _ in roadrunner_ports() if d not in known_before]
 
     deadline = time.monotonic() + timeout
+    while expect_disconnect and time.monotonic() < deadline and candidates():
+        time.sleep(0.05)
+
     while time.monotonic() < deadline:
         matches = candidates()
         if len(matches) == 1:
@@ -513,20 +483,155 @@ def _listdir(path: str) -> list[str]:
         return []
 
 
-def bootsel_volume() -> Path | None:
-    """The mounted RP2040 boot ROM volume, or None.
+def usb_port_prefix(by_path: str) -> str | None:
+    """The USB port part of a /dev/*/by-path name, interface segment dropped.
 
-    Identified by INFO_UF2.TXT at the root rather than by volume label: an
-    unrelated drive can carry the label, and on Windows the label is not part
-    of the path anyway.
+    The two names a board carries either side of a BOOTSEL reboot are not
+    string-equal - the config.interface differs, and the block device adds a
+    -scsi- suffix on top of that:
+
+        serial  pci-0000:00:14.0-usb-0:1.2:1.0
+        block   pci-0000:00:14.0-usb-0:1.2:0.0-scsi-0:0:0:0
+
+    What survives the reboot is the port. It cannot be found by pattern - the
+    port itself contains dots ("0:1.2"), so it is indistinguishable from a
+    config.interface ("1.0") by shape alone. Position is what separates them:
+    the interface is the last colon-separated component of the USB tail. Take
+    the tail after the last "-usb-" (so the PCI address's own ":14.0" is out
+    of reach), cut any "-scsi-…"/"-part1"/"-port0" suffix, and drop that last
+    component.
+    """
+    marker = by_path.rfind("-usb-")
+    if marker < 0:
+        return None
+    cut = marker + len("-usb-")
+    parts = by_path[cut:].split("-", 1)[0].split(":")
+    if len(parts) > 1 and re.fullmatch(r"\d+\.\d+", parts[-1]):
+        parts.pop()
+    tail = ":".join(parts)
+    return by_path[:cut] + tail if tail else None
+
+
+def port_topology(device: str) -> str | None:
+    """The USB port prefix serving `device`, from /dev/serial/by-path.
+
+    None off Linux, or when nothing in by-path resolves to `device`. Both are
+    ordinary; every caller has a scan to fall back on.
+    """
+    try:
+        entries = list(Path("/dev/serial/by-path").iterdir())
+        target = os.path.realpath(device)
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            if os.path.realpath(entry) == target:
+                return usb_port_prefix(entry.name)
+        except OSError:
+            continue
+    return None
+
+
+def _mount_points() -> dict[str, Path]:
+    """Resolved block device -> mount point, from /proc/mounts."""
+    mounts: dict[str, Path] = {}
+    try:
+        text = Path("/proc/mounts").read_text()
+    except OSError:
+        return mounts
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 2 or not fields[0].startswith("/dev/"):
+            continue
+        # /proc/mounts octal-escapes the characters that would otherwise break
+        # its own field splitting.
+        point = (
+            fields[1]
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+        )
+        try:
+            mounts[os.path.realpath(fields[0])] = Path(point)
+        except OSError:
+            continue
+    return mounts
+
+
+def bootsel_block_devices(prefix: str) -> list[str]:
+    """Block devices at USB port `prefix`, partitions before whole disks."""
+    try:
+        entries = sorted(
+            Path("/dev/disk/by-path").iterdir(),
+            key=lambda entry: ("-part" not in entry.name, entry.name),
+        )
+    except OSError:
+        return []
+    found = []
+    for entry in entries:
+        if usb_port_prefix(entry.name) != prefix:
+            continue
+        try:
+            found.append(os.path.realpath(entry))
+        except OSError:
+            continue
+    return found
+
+
+def bootsel_volume_at(prefix: str) -> Path | None:
+    """The mounted boot ROM volume of the board at USB port `prefix`.
+
+    Follows the block device to wherever it is actually mounted, rather than
+    looking in a path this tool predicted. That is now the only thing that
+    works: mcu-updater's udev rule mounts each board under its own topology
+    path, so the mountpoint is no longer a constant - and guessing it again
+    would break the same way the next time a rule changes.
+    """
+    mounts = _mount_points()
+    for device in bootsel_block_devices(prefix):
+        point = mounts.get(device)
+        if point is not None and (point / BOOTSEL_MARKER).is_file():
+            return point
+    return None
+
+
+def _descend(base: Path, depth: int = 3) -> list[Path]:
+    """`base` and its subdirectories down to `depth`, skipping unreadable ones.
+
+    Three levels below /media/<user> reaches mcu-updater's
+    BOOTSEL/by-path/<tag> layout without walking a whole volume.
+    """
+    found = [base]
+    if depth <= 0:
+        return found
+    for name in _listdir(str(base)):
+        child = base / name
+        try:
+            if child.is_dir():
+                found.extend(_descend(child, depth - 1))
+        except OSError:
+            continue
+    return found
+
+
+def bootsel_volume() -> Path | None:
+    """Any mounted RP2040 boot ROM volume, by scanning the automount roots.
+
+    The fallback for Windows, and for "a board was already sitting in BOOTSEL
+    when the tool started" - there is no serial port left to take a topology
+    from. Identified by INFO_UF2.TXT, never by volume label or directory name:
+    an unrelated drive can carry the label, and under the per-topology mount
+    layout the directory is named after the USB port instead.
     """
     if os.name == "nt":
         roots = [Path(f"{letter}:/") for letter in string.ascii_uppercase]
     else:
         roots = [
-            Path(parent) / user / BOOTSEL_VOLUME_NAME
+            root
             for parent in ("/media", "/run/media")
             for user in _listdir(parent)
+            for root in _descend(Path(parent) / user)
         ]
     for root in roots:
         try:
@@ -537,21 +642,40 @@ def bootsel_volume() -> Path | None:
     return None
 
 
-def wait_for_bootsel_mount(timeout: float = 10) -> Path:
+def require_writable(volume: Path) -> Path:
+    """An unwritable automount is a configuration problem, not a traceback."""
+    if not os.access(volume, os.W_OK):
+        raise RoadrunnerError(
+            f"{volume} is mounted but not writable by this user; "
+            f"on Linux check the automount's uid/gid options"
+        )
+    return volume
+
+
+def wait_for_bootsel_mount(prefix: str | None = None, timeout: float = 10) -> Path:
+    """Wait for the boot ROM volume, following `prefix` when we have one."""
+    saw_device = False
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        volume = bootsel_volume()
+        volume = bootsel_volume_at(prefix) if prefix else bootsel_volume()
         if volume is not None:
-            if not os.access(volume, os.W_OK):
-                raise RoadrunnerError(
-                    f"{volume} is mounted but not writable by this user; "
-                    f"on Linux check the automount's uid/gid options"
-                )
-            return volume
+            return require_writable(volume)
+        if prefix and not saw_device and bootsel_block_devices(prefix):
+            saw_device = True
         time.sleep(0.1)
+
+    if saw_device:
+        # Worth separating from "nothing appeared": the board did what it was
+        # told and the host did not mount it. Retrying will not help.
+        raise NoBoardError(
+            f"the board at {prefix} is in BOOTSEL - its block device is there - "
+            f"but nothing mounted it within {timeout}s. Install mcu-updater's "
+            f"udev rule, or mount the volume by hand."
+        )
     raise NoBoardError(
         f"no {BOOTSEL_VOLUME_NAME} volume (a directory containing "
         f"{BOOTSEL_MARKER}) appeared within {timeout}s"
+        + (f" for the board at {prefix}" if prefix else "")
     )
 
 
@@ -649,10 +773,11 @@ def cmd_list(args) -> int:
         return EXIT_NO_BOARD
     for device, number in attached:
         marks = []
-        if is_excluded(number):
-            marks.append("EXCLUDED")
         if UNPROVISIONED_RE.match(number):
             marks.append("unprovisioned")
+        topology = port_topology(device)
+        if topology:
+            marks.append(topology)
         suffix = f"  [{', '.join(marks)}]" if marks else ""
         print(f"{device}  {number}{suffix}")
     return EXIT_OK
@@ -697,6 +822,7 @@ def cmd_dump(args) -> int:
 
 def cmd_provision(args) -> int:
     device, number = select_port(args)
+    prefix = port_topology(device)
     others = {d for d, _ in roadrunner_ports() if d != device}
     guard_destructive(device, number, args)
 
@@ -705,7 +831,7 @@ def cmd_provision(args) -> int:
     print(f"provisioned as {new_serial}; waiting for the board to come back")
 
     wait_for_disconnect(device)
-    port = wait_for_serial_port(known_before=others)
+    port = wait_for_serial_port(known_before=others, prefix=prefix)
     result = info(port)
     if not result["provisioned"] or result["serial"] != new_serial:
         raise RoadrunnerError(
@@ -719,6 +845,7 @@ def cmd_provision(args) -> int:
 
 def cmd_clear(args) -> int:
     device, number = select_port(args)
+    prefix = port_topology(device)
     others = {d for d, _ in roadrunner_ports() if d != device}
     guard_destructive(device, number, args)
 
@@ -726,7 +853,7 @@ def cmd_clear(args) -> int:
     print("identity cleared; waiting for the board to come back")
 
     wait_for_disconnect(device)
-    port = wait_for_serial_port(known_before=others)
+    port = wait_for_serial_port(known_before=others, prefix=prefix)
     result = info(port)
     if result["provisioned"]:
         raise RoadrunnerError(
@@ -739,11 +866,17 @@ def cmd_clear(args) -> int:
 
 def cmd_bootsel(args) -> int:
     device, number = select_port(args)
+    prefix = port_topology(device)
     guard_destructive(device, number, args)
 
     reboot_bootsel(device)
-    volume = wait_for_bootsel_mount()
+    volume = wait_for_bootsel_mount(prefix)
     print(f"BOOTSEL volume at {volume}")
+    if prefix is None:
+        print(
+            "note: found by scanning, not by USB port - this is the right "
+            "volume only if no other board is in BOOTSEL"
+        )
     return EXIT_OK
 
 
@@ -754,16 +887,28 @@ def cmd_flash(args) -> int:
     if uf2.suffix.lower() != ".uf2":
         raise RoadrunnerError(f"{uf2} is not a .uf2 image")
 
-    volume = bootsel_volume()
+    # A board named on the command line wins over one already sitting in
+    # BOOTSEL: naming it is the whole point, and routing it there ourselves is
+    # the only way to know which volume is which afterwards.
+    named = bool(getattr(args, "port", None) or getattr(args, "serial", None))
+    volume = None if named else bootsel_volume()
+
     others: set[str] = set()
+    prefix: str | None = None
     if volume is None:
         device, number = select_port(args)
+        prefix = port_topology(device)
         others = {d for d, _ in roadrunner_ports() if d != device}
         guard_destructive(device, number, args)
         reboot_bootsel(device)
-        volume = wait_for_bootsel_mount()
+        volume = wait_for_bootsel_mount(prefix)
     else:
+        require_writable(volume)
         print(f"a board is already in BOOTSEL at {volume}")
+        print(
+            "note: found by scanning, so this is the right volume only if no "
+            "other board is in BOOTSEL"
+        )
         if not args.yes:
             if input("Flash it? [y/N] ").strip().lower() not in ("y", "yes"):
                 raise RoadrunnerError("cancelled")
@@ -773,7 +918,9 @@ def cmd_flash(args) -> int:
 
     # A normal UF2 update preserves the identity sector, so a provisioned
     # board stays provisioned and an erased sector stays erased.
-    port = wait_for_serial_port(known_before=others, timeout=20)
+    port = wait_for_serial_port(
+        known_before=others, prefix=prefix, timeout=20, expect_disconnect=True
+    )
     print_info(info(port))
     return EXIT_OK
 
@@ -835,11 +982,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serial", help="board serial, with or without the RR- prefix")
     parser.add_argument(
         "-y", "--yes", action="store_true", help="skip confirmation prompts"
-    )
-    parser.add_argument(
-        "--allow-excluded",
-        action="store_true",
-        help="permit destructive commands on a board in EXCLUDED_SERIALS",
     )
 
     sub = parser.add_subparsers(dest="command")

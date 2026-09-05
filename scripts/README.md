@@ -59,7 +59,8 @@ python3 roadrunner_admin.py flash roadrunner_usbserial_grb.uf2
 ```
 
 The menu covers everything except `read` and `flash`, which take arguments -
-use the subcommand form for those.
+use the subcommand form for those, and for selecting between boards when more
+than one is attached.
 
 With more than one board attached, select one with `--port COM7` or
 `--serial RR-...`.  `--serial` is refused when it matches more than one board:
@@ -67,9 +68,27 @@ unprovisioned boards share a flash UID and therefore share a USB serial.
 
 `provision`, `clear`, `bootsel` and `flash` reset the board, warn that this
 drops any Klipper connection it is serving over I2C or UART, and ask for
-confirmation (`-y` skips the prompt).  They also refuse the boards listed in
-`EXCLUDED_SERIALS`, which are the ones installed in printers; `--allow-excluded`
-overrides that.  The read-only commands see every attached board.
+confirmation (`-y` skips the prompt).
+
+#### Finding the board again after a BOOTSEL reboot
+
+On Linux the tool records the board's USB port from `/dev/serial/by-path`
+before rebooting it, then looks for a matching entry in `/dev/disk/by-path` and
+finds where that block device is actually mounted, via `/proc/mounts`.  It
+never assumes a mountpoint.  That matters because mcu-updater's udev rule now
+mounts each board under its own topology path
+(`/media/<user>/BOOTSEL/by-path/<tag>`) rather than a single fixed
+`/media/<user>/RPI-RP2`, so a hardcoded path finds nothing - and following the
+device works whatever rule the host happens to have.
+
+If the block device appears but nothing mounts it, the tool says so
+specifically rather than timing out: that means no udev rule is installed, and
+retrying will not help.
+
+On Windows, and for a board that was already sitting in BOOTSEL before the tool
+started, there is no port to follow.  It falls back to scanning the automount
+roots for a directory containing `INFO_UF2.TXT`, and says when it did - that
+result is only trustworthy with one board in BOOTSEL.
 
 Exit codes: 0 ok, 2 usage, 3 no board found, 4 ambiguous selection,
-5 the firmware refused, 6 protocol error, 7 excluded board.
+5 the firmware refused, 6 protocol error.
