@@ -3,8 +3,25 @@
 ## Dependencies
 
 ```sh
-sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+sudo apt install build-essential cmake gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
 ```
+
+`build-essential` provides the host compiler used to build `picotool`.
+
+The firmware is pinned to pico-sdk 2.3.0, which requires **picotool 2.3.0** to
+turn the linked ELF into the `.uf2` files — every target here calls
+`pico_add_extra_outputs`, so this is not optional. If no matching picotool is
+installed, the SDK clones and builds it automatically during `cmake ..`, which
+needs network access at configure time. To avoid re-downloading it for every
+build directory, either install picotool 2.3.0 system-wide, or point the SDK at
+a shared checkout:
+
+```sh
+cmake -DPICOTOOL_FETCH_FROM_GIT_PATH=~/.picotool ..
+```
+
+A picotool of any other version causes a configure error; update the
+installation or pass `-DPICOTOOL_FORCE_FETCH_FROM_GIT=1` to ignore it.
 
 ## Configuring
 

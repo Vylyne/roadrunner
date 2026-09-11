@@ -35,6 +35,10 @@ its encoder and filament-presence data into runout and under-extrusion signals.
 ## Build and verification
 
 - Initialise the SDK before building: `git submodule update --init --recursive`.
+- pico-sdk 2.3.0 requires picotool 2.3.0 to emit the `.uf2` outputs. It is not
+  vendored: the SDK downloads and builds it at configure time unless a matching
+  picotool is installed, so a first configure needs network access. Set
+  `PICOTOOL_FETCH_FROM_GIT_PATH` to share one checkout across build dirs.
 - Build from `rp2040/` in an ignored build directory, for example:
   `cmake -S . -B build && cmake --build build`.
 - Run `git diff --check` before handing off a change.
