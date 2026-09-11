@@ -2,6 +2,7 @@
 #include "identity_record.h"
 #include "usb_descriptor_strings.h"
 #include <assert.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -113,6 +114,90 @@ static void test_reports_flash_uid(void) {
     assert(memcmp(buf, test_flash_uid, RR_REG_FLASH_UID_SIZE) == 0);
 }
 
+/* docs/roadrunner-usb-admin-protocol.md, "Golden vector". */
+#define GOLDEN_IMAGE_START 0x10000000u
+#define GOLDEN_IMAGE_LENGTH 600u
+#define GOLDEN_IMAGE_DIGEST 0xbbe38aa9u
+
+static uint8_t golden_image[GOLDEN_IMAGE_LENGTH];
+
+static void install_golden_image(void) {
+    for (size_t index = 0; index < GOLDEN_IMAGE_LENGTH; ++index) {
+        golden_image[index] = (uint8_t)((index * 7u + 3u) & 0xffu);
+    }
+    rr_image_digest_init(golden_image, GOLDEN_IMAGE_START, GOLDEN_IMAGE_LENGTH);
+}
+
+static uint32_t read_u32(const uint8_t *buf) {
+    return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8)
+        | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+}
+
+static void test_reports_image_digest(void) {
+    uint8_t buf[64];
+    size_t length = 0u;
+
+    configure(RR_IDENTITY_OK);
+    install_golden_image();
+
+    /* Four bytes exactly: this register fits Klipper's ten-byte tmcuart
+     * buffer, and a UART host asking for more is an MCU shutdown rather than
+     * a failed read. Growing it breaks that transport silently. */
+    assert(rr_identity_registers_read(RR_REG_IMAGE_DIGEST, buf, &length));
+    assert(length == 4u);
+    assert(read_u32(buf) == GOLDEN_IMAGE_DIGEST);
+}
+
+static void test_reports_image_range(void) {
+    uint8_t buf[64];
+    size_t length = 0u;
+
+    configure(RR_IDENTITY_OK);
+    install_golden_image();
+
+    assert(rr_identity_registers_read(RR_REG_IMAGE_RANGE, buf, &length));
+    assert(length == 8u);
+    assert(read_u32(buf) == GOLDEN_IMAGE_START);
+    assert(read_u32(buf + 4u) == GOLDEN_IMAGE_LENGTH);
+}
+
+static void test_image_digest_register_refuses_without_a_digest(void) {
+    uint8_t buf[64];
+    size_t length = 0xdeadu;
+
+    /* 0x00000000 is a legal CRC, and this register has no room for an
+     * algorithm byte to say "none" - so a board with no digest declines the
+     * register rather than answering with a number a host would compare. */
+    configure(RR_IDENTITY_OK);
+    rr_image_digest_init(NULL, GOLDEN_IMAGE_START, GOLDEN_IMAGE_LENGTH);
+
+    assert(!rr_identity_registers_read(RR_REG_IMAGE_DIGEST, buf, &length));
+    assert(length == 0xdeadu);
+
+    /* The range register still answers: it says which bytes a digest would
+     * have covered, which is useful even when there is no digest. */
+    assert(rr_identity_registers_read(RR_REG_IMAGE_RANGE, buf, &length));
+    assert(length == 8u);
+
+    install_golden_image();
+}
+
+static void test_image_registers_readable_while_locked(void) {
+    uint8_t buf[64];
+    size_t length = 0u;
+
+    /* "Which build is this" is the question you most need answered about a
+     * board that is refusing to serve sensor data. */
+    configure(RR_IDENTITY_NONE);
+    install_golden_image();
+
+    assert(rr_identity_registers_locked());
+    assert(rr_identity_registers_read(RR_REG_IMAGE_DIGEST, buf, &length));
+    assert(read_u32(buf) == GOLDEN_IMAGE_DIGEST);
+    assert(rr_identity_registers_read(RR_REG_IMAGE_RANGE, buf, &length));
+    assert(read_u32(buf) == GOLDEN_IMAGE_START);
+}
+
 static void test_ignores_unknown_registers(void) {
     uint8_t buf[64];
     size_t length = 0xdeadu;
@@ -121,7 +206,9 @@ static void test_ignores_unknown_registers(void) {
     assert(!rr_identity_registers_read(0x10u, buf, &length));
     assert(length == 0xdeadu);
     assert(!rr_identity_registers_read(0x24u, buf, &length));
-    assert(!rr_identity_registers_read(0x35u, buf, &length));
+    /* 0x35 and 0x36 became the image-digest registers; 0x37 is the first
+     * address past the window and is the one that must stay unknown. */
+    assert(!rr_identity_registers_read(0x37u, buf, &length));
 }
 
 static void test_locked_without_a_valid_identity(void) {
@@ -206,6 +293,10 @@ int main(void) {
     test_reports_firmware_version();
     test_reports_variant();
     test_reports_flash_uid();
+    test_reports_image_digest();
+    test_reports_image_range();
+    test_image_digest_register_refuses_without_a_digest();
+    test_image_registers_readable_while_locked();
     test_ignores_unknown_registers();
     test_locked_without_a_valid_identity();
     test_unlocked_once_provisioned();

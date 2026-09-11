@@ -1,5 +1,7 @@
 #include "usb_admin.h"
 
+#include "image_digest.h"
+
 #include <string.h>
 
 #if defined(PICO_ON_DEVICE) && PICO_ON_DEVICE
@@ -12,7 +14,12 @@ enum {
     RR_USB_ADMIN_VERSION = 0x01,
     RR_USB_ADMIN_RESPONSE = 0x80,
     RR_USB_ADMIN_MAX_PAYLOAD = 64,
-    RR_USB_ADMIN_MAX_RESPONSE_PAYLOAD = 96,
+    /* Raised from 96 when the image-digest fields were added. The
+     * maximum INFO payload is 107 bytes with the current field limits, so
+     * this leaves room without another revision for the next small field. A
+     * host must parse payload_length rather than sizing a fixed buffer;
+     * docs/roadrunner-usb-admin-protocol.md says so normatively. */
+    RR_USB_ADMIN_MAX_RESPONSE_PAYLOAD = 128,
     RR_USB_ADMIN_MAX_VERSION_LENGTH = 32,
 };
 
@@ -202,8 +209,20 @@ static void rr_usb_admin_make_serial(char serial[35]) {
     serial[17u + RR_USB_ADMIN_FLASH_UID_SIZE * 2u] = '\0';
 }
 
+/* Little-endian, matching the two 32-bit INFO fields and registers 0x35
+ * and 0x36. Written byte by byte rather than memcpy'd from a uint32_t so the
+ * wire order does not depend on the host compiler when this file is built
+ * off-target for the tests. */
+static void rr_usb_admin_put_u32(uint8_t *buf, uint32_t value) {
+    buf[0] = (uint8_t)(value & 0xffu);
+    buf[1] = (uint8_t)((value >> 8) & 0xffu);
+    buf[2] = (uint8_t)((value >> 16) & 0xffu);
+    buf[3] = (uint8_t)((value >> 24) & 0xffu);
+}
+
 static void rr_usb_admin_send_info(void) {
     uint8_t payload[RR_USB_ADMIN_MAX_RESPONSE_PAYLOAD];
+    const struct rr_image_digest *image;
     char serial[35];
     size_t version_length = rr_usb_admin_string_length(
         rr_usb_admin_config.firmware_version, RR_USB_ADMIN_MAX_VERSION_LENGTH);
@@ -236,6 +255,27 @@ static void rr_usb_admin_send_info(void) {
         memset(payload + length, 0, RR_USB_ADMIN_FLASH_UID_SIZE);
     }
     length += RR_USB_ADMIN_FLASH_UID_SIZE;
+
+    /* The digest is labelled with its algorithm rather than sent bare: two
+     * sides comparing numbers produced by different functions agree on the
+     * field and disagree on the value forever. Algorithm NONE carries a
+     * zero-length digest, because 0x00000000 is itself a legal CRC. */
+    image = rr_image_digest_get();
+    payload[length++] = image->algorithm;
+    if (image->algorithm == RR_IMAGE_DIGEST_NONE) {
+        payload[length++] = 0u;
+    } else {
+        payload[length++] = RR_IMAGE_DIGEST_SIZE;
+        rr_usb_admin_put_u32(payload + length, image->digest);
+        length += RR_IMAGE_DIGEST_SIZE;
+    }
+    /* The range is reported either way: a host still needs it to know which
+     * bytes a digest it obtains elsewhere would have to cover. */
+    rr_usb_admin_put_u32(payload + length, image->start);
+    length += 4u;
+    rr_usb_admin_put_u32(payload + length, image->length);
+    length += 4u;
+
     rr_usb_admin_send_response(RR_USB_ADMIN_INFO, payload, length);
 }
 

@@ -46,6 +46,14 @@ static void rr_usb_admin_reboot_application(void *context)
     }
 }
 
+/* Provided by the SDK's linker script (pico_standard_link): the extent of
+ * the linked application image in XIP flash. The reserved identity sector at
+ * ROADRUNNER_IDENTITY_FLASH_OFFSET sits past __flash_binary_end - the
+ * application region is capped at exactly that offset - so provisioning,
+ * clearing and re-provisioning never change a board's digest. */
+extern char __flash_binary_start;
+extern char __flash_binary_end;
+
 static void rr_usb_admin_init_for_firmware(
     const struct rr_identity_store *identity_store)
 {
@@ -87,6 +95,24 @@ static void rr_usb_admin_init_for_firmware(
             .firmware_version = config.firmware_version,
         };
         rr_identity_registers_init(&register_config);
+    }
+
+    {
+        const uint8_t *image = (const uint8_t *)&__flash_binary_start;
+        uintptr_t start = (uintptr_t)&__flash_binary_start;
+        uintptr_t end = (uintptr_t)&__flash_binary_end;
+
+        rr_image_digest_init(image, (uint32_t)start,
+                             end > start ? (uint32_t)(end - start) : 0u);
+
+        /* Compute it now, while nothing is serving a bus yet. The lazy path
+         * inside rr_image_digest_get() would otherwise do its ~16 ms pass
+         * over XIP flash inside whichever transport asked first - for the
+         * I2C build that is the target ISR, clock-stretching the bus for
+         * 16 ms, and for the UART build it lands inside the bit-banged
+         * response window. Both are protocol-timing faults that no host
+         * test can see. Every later call is a cached struct read. */
+        (void)rr_image_digest_get();
     }
 
     rr_usb_admin_init(&config);

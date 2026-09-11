@@ -32,6 +32,15 @@ static void rr_identity_registers_copy_string(uint8_t *buf, size_t size,
     }
 }
 
+/* Little-endian, matching the INFO payload's two 32-bit fields. */
+static void rr_identity_registers_put_u32(uint8_t *buf, uint32_t value)
+{
+    buf[0] = (uint8_t)(value & 0xffu);
+    buf[1] = (uint8_t)((value >> 8) & 0xffu);
+    buf[2] = (uint8_t)((value >> 16) & 0xffu);
+    buf[3] = (uint8_t)((value >> 24) & 0xffu);
+}
+
 bool rr_identity_registers_read(uint8_t reg, uint8_t *buf, size_t *length)
 {
     struct rr_usb_descriptor_strings strings;
@@ -81,6 +90,31 @@ bool rr_identity_registers_read(uint8_t reg, uint8_t *buf, size_t *length)
         }
         *length = RR_REG_FLASH_UID_SIZE;
         return true;
+
+    case RR_REG_IMAGE_DIGEST: {
+        const struct rr_image_digest *image = rr_image_digest_get();
+
+        if (image->algorithm == RR_IMAGE_DIGEST_NONE) {
+            /* Unlike INFO, this register has no room to say "no digest".
+             * Refuse to answer rather than return a zero that a host would
+             * compare against a real CRC - the caller falls through, and on a
+             * locked board that means the 0xff refusal fill, which is out of
+             * range for a digest a host has on file. */
+            return false;
+        }
+        rr_identity_registers_put_u32(buf, image->digest);
+        *length = RR_REG_IMAGE_DIGEST_SIZE;
+        return true;
+    }
+
+    case RR_REG_IMAGE_RANGE: {
+        const struct rr_image_digest *image = rr_image_digest_get();
+
+        rr_identity_registers_put_u32(buf, image->start);
+        rr_identity_registers_put_u32(buf + 4u, image->length);
+        *length = RR_REG_IMAGE_RANGE_SIZE;
+        return true;
+    }
 
     default:
         return false;

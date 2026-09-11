@@ -23,6 +23,8 @@
 - [x] A board without a valid identity refuses to serve sensor data
 - [x] Board identity, firmware version and variant in the Klipper printer
   object, for host tools to map a sensor to its USB device
+- [x] A digest of the firmware image the board is actually running, so a host
+  tool can tell a bad or mismatched flash write from a good one
 
 Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
 UF2 update preserves the identity record; the direct-USB `CLEAR_IDENTITY`
@@ -59,6 +61,11 @@ extra's on-connect path — every route above ultimately goes over USB.
 
 - [ ] Add GitHub Actions firmware build and release artifacts, plus repeatable
   protocol validation on a bench board.
+- [ ] Confirm the image digest on a bench board: that `__flash_binary_end`
+  gives the same length the UF2 covers, that `scripts/uf2_image_digest.py`
+  reproduces what the board reports for a real build, and that the ~16 ms
+  first-read cost does not disturb the sensor poll. Nothing in this feature
+  has run on hardware yet.
 - [ ] Make a UART-wired board identifiable from the printer object. Klipper's
   ten-byte `tmcuart` buffer caps that transport at four-byte registers, so
   `identity.serial` and `identity.firmware_version` are null there and a host
@@ -189,6 +196,12 @@ necessarily the board that left.
     "transport": "usb",        # i2c / uart / usb, as built into the firmware
     "led_order": "grb"         # rgb / grb
 },
+"firmware_image": {
+    "algorithm": "crc32-iso-hdlc",
+    "digest": "0xbbe38aa9",
+    "start": 268435456,        # 0x10000000, the XIP base
+    "length": 205124           # bytes the digest covers
+},
 "connection": {
     "port": "/dev/serial/by-id/...",   # as configured, usbserial only
     "device_path": "/dev/ttyACM0",     # what that resolves to
@@ -215,6 +228,32 @@ Klipper's MCU-side `tmcuart` buffer holds ten bytes, and asking for more is an
 MCU shutdown rather than a failed read, which caps this transport at four-byte
 registers. `state` and the variant fields fit; the two strings do not. I2C and
 usbserial report everything.
+
+`firmware_image` answers a different question from `identity.firmware_version`.
+The version is a string the build stamps in - it says which source the board
+claims to be. The digest is computed over the bytes the board is executing, so
+it catches a truncated BOOTSEL copy that boots and behaves, or a board
+carrying a build nobody expected. A host compares it against the same byte
+range extracted from the `.uf2` it believes it flashed;
+`scripts/uf2_image_digest.py` is the reference implementation of that
+extraction, and `docs/roadrunner-usb-admin-protocol.md` carries the golden
+vector both sides test against.
+
+The digest is never reported bare. `algorithm` is always alongside it, because
+"CRC32" names several mutually incompatible functions and two sides comparing
+numbers from different ones agree on the field and disagree on the value
+forever.
+
+**It is not attestation.** The firmware computing the digest is the firmware
+in question, so anything able to replace the image can replace the hasher and
+report whatever it likes. It is evidence against accident, never against
+substitution; which bytes were actually written stays a host-side record.
+
+Over UART the digest is present but `start` and `length` are `null`: the
+four-byte digest register fits the `tmcuart` ceiling and the eight-byte range
+register does not. That is enough to tell two boards apart or to compare a
+board against a number recorded earlier, not enough to check one against a
+file.
 
 The flash UID (register `0x34`) is deliberately not reported: the protocol
 document says hosts must not persist it, and anything in the printer object is

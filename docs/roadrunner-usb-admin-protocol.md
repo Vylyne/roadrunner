@@ -126,10 +126,104 @@ The INFO response payload fields occur in this order:
 | firmware version length + version | 1 + up to 32 | ASCII, normally CMake `dev` |
 | serial length + serial | 1 + up to 33 | ASCII serial namespace below |
 | flash UID | 8 | Raw diagnostic bytes, not identity |
+| digest algorithm | 1 | `0` none, `1` CRC-32/ISO-HDLC (see below) |
+| digest length + digest | 1 + up to 4 | Digest value, little-endian |
+| image start | 4 | Little-endian XIP address the digest covers from |
+| image length | 4 | Little-endian byte count the digest covers |
 
-The maximum INFO payload is 93 bytes with the current field limits (and is
-within the 96-byte response limit). Integers are unsigned bytes; strings are
-not NUL-terminated in the frame.
+The maximum INFO payload is 107 bytes with the current field limits, within
+the 128-byte response limit. Integers other than the two explicitly
+little-endian 32-bit fields are unsigned bytes; strings are not
+NUL-terminated in the frame.
+
+**The response limit was 96 bytes before the digest fields existed**, and
+this revision raises it to 128. A host must parse `payload_length` and read
+that many bytes rather than sizing a fixed buffer; one that hard-codes 96
+truncates INFO on a board built after this revision. That is also how a host
+detects the fields' absence: a pre-revision board returns a 93-byte payload
+with nothing after the flash UID, not a digest algorithm of `0`. A board that
+reports algorithm `0` is a current board that could not compute a digest.
+
+## Firmware image digest
+
+The board reports a digest of the bytes it is executing. This detects a bad
+or mismatched flash write - a truncated BOOTSEL copy that boots and behaves,
+or a board carrying a build nobody expected. **It is not attestation.** The
+firmware computing the digest is the firmware in question, so anything able
+to replace the image can replace the hasher and report whatever it likes. The
+digest is evidence against accident, never against substitution; no trust
+claim should be built on it.
+
+### The algorithm
+
+Algorithm `1` is **CRC-32/ISO-HDLC**: reflected polynomial `0xEDB88320`,
+initial value `0xFFFFFFFF`, reflected input and output, final XOR
+`0xFFFFFFFF`. This is what Python's `zlib.crc32` and `binascii.crc32`
+compute. "CRC32" on its own names at least half a dozen mutually
+incompatible functions and is not a specification; implementations must check
+against the golden vector below rather than against each other.
+
+Algorithm `0` means the board has no digest to report. Its digest length is
+`0` and no digest bytes follow, but `image start` and `image length` are
+still present and still valid.
+
+### The byte range
+
+The digest covers `[image start, image start + image length)` as the board
+reports them, which on current firmware is `__flash_binary_start` through
+`__flash_binary_end` - the linked application image, from the XIP base at
+`0x10000000` to the end of the last linked section.
+
+The reserved identity sector at flash offset `0x1FF000` is **outside** that
+range: the application region is capped at `0x1FF000`
+(`ROADRUNNER_APPLICATION_FLASH_SIZE`), so the sector begins exactly where the
+image must already have ended. Provisioning, clearing and re-provisioning a
+board therefore never change its digest, and two boards flashed from the same
+UF2 report the same number whatever their identity.
+
+**A host must use the reported start and length and must not substitute its
+own.** The linked image does not end on a 256-byte boundary, so the final UF2
+block is padded; only the reported length says where the image stops.
+
+### Reconstructing the range from a UF2
+
+A `.uf2` is a container - 512-byte blocks each carrying a 32-byte header, up
+to 476 bytes of payload, a target address and a trailing magic - so a digest
+of the file is not a digest of what lands in flash. A host comparing a board
+against a UF2 must, for each block:
+
+1. Verify the three magic values; reject the container otherwise.
+2. Skip the block if flag bit `0` (`NOT_MAIN_FLASH`) is set.
+3. Read `payloadSize` from the header. **Do not assume 256** - that is a
+   convention of the tooling, not a rule of the format.
+4. Place payload byte `i` at address `targetAddr + i`, discarding any byte
+   that falls outside `[start, start + length)`.
+
+Then require that every byte of the range was supplied by some block, and
+digest exactly `length` bytes. A gap is an error, not a hole to fill with
+`0xFF`: filling produces a plausible wrong number instead of a visible
+failure.
+
+`scripts/uf2_image_digest.py` is the reference implementation of exactly
+this, and is small enough to reimplement.
+
+### Golden vector
+
+Both sides test against this vector, not against each other.
+
+The image is 600 bytes at start address `0x10000000`, where byte `i` is
+`(i * 7 + 3) & 0xff`. Its CRC-32/ISO-HDLC is:
+
+```text
+0xBBE38AA9
+```
+
+Packed into a UF2 as three blocks with 256-byte payloads at `0x10000000`,
+`0x10000100` and `0x10000200`, the third block's payload is 88 image bytes
+followed by 168 bytes of padding. A correct reconstruction discards that
+padding and reports `0xBBE38AA9`; a host that digests the container, or that
+rounds the length up to 768, does not. `tests/test_uf2_image_digest.py`
+builds the vector and checks both outcomes.
 
 ## Identity register window
 
@@ -143,8 +237,10 @@ directly on the sensor transport itself:
 | `0x32` | `READ_FIRMWARE_VERSION` | 32 | ASCII, NUL-padded |
 | `0x33` | `READ_VARIANT` | 2 | transport byte, LED-order byte |
 | `0x34` | `READ_FLASH_UID` | 8 | Raw diagnostic bytes |
+| `0x35` | `READ_IMAGE_DIGEST` | 4 | CRC-32/ISO-HDLC of the image, little-endian |
+| `0x36` | `READ_IMAGE_RANGE` | 8 | Image start, then image length, both little-endian |
 
-These five registers are readable over I2C, UART, and usbserial, whether or
+These registers are readable over I2C, UART, and usbserial, whether or
 not the board is provisioned — they are both the unprovisioned allow-list and
 the steady-state identity source. Field order and encoding mirror the USB
 `INFO` payload deliberately, so this document stays the single definition of
@@ -157,9 +253,10 @@ and a request for more is `shutdown("tmcuart data too large")` — an MCU
 shutdown, not a failed read. The bit-banged read asks for
 `(((4 + reg_length) * 10) + 7) // 8` bytes, which reaches exactly ten at a
 four-byte register, so four bytes is a hard ceiling on that transport.
-`READ_IDENTITY_STATE` (1) and `READ_VARIANT` (2) fit; `READ_SERIAL` (34),
-`READ_FIRMWARE_VERSION` (32) and `READ_FLASH_UID` (8) do not, and a host must
-not attempt them over UART. Serving them there would need the firmware to
+`READ_IDENTITY_STATE` (1), `READ_VARIANT` (2) and `READ_IMAGE_DIGEST` (4)
+fit; `READ_SERIAL` (34), `READ_FIRMWARE_VERSION` (32), `READ_FLASH_UID` (8)
+and `READ_IMAGE_RANGE` (8) do not, and a host must not attempt them over
+UART. Serving them there would need the firmware to
 offer the window in four-byte chunks, which it does not. I2C and usbserial
 carry the whole window.
 
@@ -176,6 +273,23 @@ version therefore survives `INFO` intact but truncates to 31 characters in
 the register. This is a known, accepted divergence between the two
 encodings, not a bug.
 
+`READ_IMAGE_DIGEST` (`0x35`) is fixed to CRC-32/ISO-HDLC by this register's
+definition rather than carrying an algorithm byte, which is what lets it fit
+the four-byte UART ceiling. INFO's digest field is self-describing because
+INFO is a versioned payload where a future algorithm change has to be
+expressible; a different register algorithm would take a different register
+number instead. A UART host therefore reads the digest value but cannot read
+`READ_IMAGE_RANGE`, so it can compare two boards or compare a board against a
+number it recorded earlier, but it cannot reconstruct the range from a UF2.
+
+A board that has no digest to report — algorithm `NONE` in `INFO` — declines
+`READ_IMAGE_DIGEST` outright rather than answering, because `0x00000000` is
+itself a legal CRC and this register has no room to say "none". The refusal
+reads as a zero-length answer, not as a value: hosts must treat a short or
+empty read of `0x35` as "no digest", never as a digest of zero.
+`READ_IMAGE_RANGE` (`0x36`) still answers, since which bytes a digest would
+cover is useful even when there is no digest.
+
 Hosts must not persist the flash UID (`0x34`) as an identity; it is a
 diagnostic value only and is not guaranteed unique across boards from the
 same batch.
@@ -184,7 +298,7 @@ same batch.
 
 While the board has no valid identity — `READ_IDENTITY_STATE` is anything
 other than `1` (`OK`), which includes `CONFLICT` and `IO_ERROR`, not only
-`NONE` — every register outside the identity window (`0x30`–`0x34`) returns
+`NONE` — every register outside the identity window (`0x30`–`0x36`) returns
 its normal length filled with `0xFF`. A host must read `READ_IDENTITY_STATE`
 (`0x30`) to distinguish a locked board from a genuine sensor fault — `0xFF`
 is out of range for almost every field, so an unpatched host reads visibly

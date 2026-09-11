@@ -92,6 +92,8 @@ class IdentityRegister:
     SERIAL = 0x31
     FIRMWARE_VERSION = 0x32
     VARIANT = 0x33
+    IMAGE_DIGEST = 0x35
+    IMAGE_RANGE = 0x36
 
     # The firmware does not carry a length in its reply, so these are the
     # caller's half of an agreement with it. Source of truth is the register
@@ -101,10 +103,68 @@ class IdentityRegister:
         SERIAL: 34,
         FIRMWARE_VERSION: 32,
         VARIANT: 2,
+        IMAGE_DIGEST: 4,
+        IMAGE_RANGE: 8,
     }
 
 TRANSPORT_NAMES : dict[int, str] = {1: "i2c", 2: "uart", 3: "usb"}
 LED_ORDER_NAMES : dict[int, str] = {1: "rgb", 2: "grb"}
+
+# Register 0x35 is fixed to one algorithm by its definition rather than
+# carrying an algorithm byte - that is what lets its four bytes fit the UART
+# ceiling. A future algorithm would take a different register number, so this
+# is a constant rather than something read off the board.
+IMAGE_DIGEST_ALGORITHM = "crc32-iso-hdlc"
+
+class FirmwareImage:
+    """ A digest of the bytes the board is actually executing.
+
+    This detects a bad or mismatched flash write - a truncated BOOTSEL copy
+    that boots and behaves, or a board carrying a build nobody expected. It is
+    not attestation: the firmware computing the digest is the firmware in
+    question, so anything able to replace the image can replace the hasher.
+    Treat it as evidence against accident, never against substitution.
+
+    `start` and `length` are what a host needs to reconstruct the same byte
+    range out of a .uf2 and compare. They come from a separate register that
+    does not fit the UART transport, so over UART the digest arrives without
+    them - still enough to tell two boards apart, not enough to check one
+    against a file. """
+
+    def __init__(self, digest : typing.Optional[int],
+                 start : typing.Optional[int] = None,
+                 length : typing.Optional[int] = None):
+        self.digest = digest
+        self.start = start
+        self.length = length
+
+    def __repr__(self):
+        return "%s(digest=%s, start=%s, length=%s)" % (
+            self.__class__.__name__,
+            "None" if self.digest is None else "%#010x" % (self.digest,),
+            self.start, self.length)
+
+    def get_status(self):
+        """ The digest is labeled with its algorithm, never reported bare.
+
+        A bare number is the failure this shape exists to prevent: two sides
+        comparing digests computed by different functions agree on the field
+        and disagree on the value forever. """
+        return {
+            "algorithm": None if self.digest is None else IMAGE_DIGEST_ALGORITHM,
+            # A hex string rather than an int: it is an identifier to compare,
+            # not a quantity to do arithmetic on, and it travels through
+            # Moonraker's JSON unambiguously at any width.
+            "digest": None if self.digest is None else "%#010x" % (self.digest,),
+            "start": self.start,
+            "length": self.length,
+        }
+
+    @staticmethod
+    def unknown_status():
+        """ The same shape with nothing filled in - see
+        SensorIdentity.unknown_status for why this is built, not written. """
+        return FirmwareImage(None).get_status()
 
 def decode_identity_string(data : typing.Optional[bytearray]) -> typing.Optional[str]:
     """ Decode a NUL-padded ASCII identity register.
@@ -245,6 +305,9 @@ class SensorUART(tmc_uart.MCU_TMC_uart_bitbang):
 class RegisterReaderGeneric:
     # The identity registers this transport can carry. Every transport can
     # read the whole window unless it says otherwise, and one cannot.
+    image_registers = (IdentityRegister.IMAGE_DIGEST,
+                       IdentityRegister.IMAGE_RANGE)
+
     identity_registers = (IdentityRegister.STATE, IdentityRegister.SERIAL,
                           IdentityRegister.FIRMWARE_VERSION, IdentityRegister.VARIANT)
 
@@ -303,6 +366,34 @@ class RegisterReaderGeneric:
             led_order=variant[1] if variant else None,
         )
 
+    def read_firmware_image(self) -> typing.Optional[FirmwareImage]:
+        """ Read the image digest and the range it covers.
+
+        The digest is the anchor here: without it there is nothing worth
+        reporting, and the caller retries. The range is best-effort for the
+        same reason the identity strings are - it does not fit every
+        transport. """
+        registers = self.image_registers
+        digest = None
+        if IdentityRegister.IMAGE_DIGEST in registers:
+            digest = self.read_reg(
+                IdentityRegister.IMAGE_DIGEST,
+                IdentityRegister.SIZES[IdentityRegister.IMAGE_DIGEST])
+        if not digest or len(digest) != IdentityRegister.SIZES[IdentityRegister.IMAGE_DIGEST]:
+            return None
+
+        start = length = None
+        if IdentityRegister.IMAGE_RANGE in registers:
+            image_range = self.read_reg(
+                IdentityRegister.IMAGE_RANGE,
+                IdentityRegister.SIZES[IdentityRegister.IMAGE_RANGE])
+            if image_range is not None and \
+                    len(image_range) == IdentityRegister.SIZES[IdentityRegister.IMAGE_RANGE]:
+                start, length = struct.unpack("<LL", bytes(image_range))
+
+        return FirmwareImage(struct.unpack("<L", bytes(digest))[0],
+                             start=start, length=length)
+
 class RegisterReaderUART(RegisterReaderGeneric):
     # Klipper's MCU-side tmcuart buffer is ten bytes (`uint8_t data[10]` in
     # klipper/src/tmcuart.c), and asking for more is not a failed read - it is
@@ -317,6 +408,11 @@ class RegisterReaderUART(RegisterReaderGeneric):
     # window in four-byte chunks, which it does not.
     MAX_REGISTER_LENGTH = 4
     identity_registers = (IdentityRegister.STATE, IdentityRegister.VARIANT)
+    # The digest is exactly four bytes and fits; the range register is eight
+    # and does not. A UART host gets a number it can compare against another
+    # board or against one it recorded earlier, but cannot reconstruct the
+    # range out of a .uf2 to check the board against a file.
+    image_registers = (IdentityRegister.IMAGE_DIGEST,)
 
     def __init__(self, uart):
         self.uart = uart
@@ -783,6 +879,7 @@ class HighResolutionFilamentSensor:
 
         # Board identity, read from the sensor once it answers
         self._identity : typing.Optional[SensorIdentity] = None
+        self._firmware_image : typing.Optional[FirmwareImage] = None
         self._identity_next_attempt = 0.
         self._device_path : typing.Optional[str] = None
         self._reads_ok = 0
@@ -822,6 +919,10 @@ class HighResolutionFilamentSensor:
             if self._identity.firmware_version:
                 msg += f", firmware {self._identity.firmware_version}"
             msg += "\n"
+        if self._firmware_image is not None \
+                and self._firmware_image.digest is not None:
+            status = self._firmware_image.get_status()
+            msg += f"- image {status['algorithm']} {status['digest']}\n"
         msg += f"- filament {filament_present}\n"
         msg += f"- runout {runout_detected}\n"
         msg += f"- underextrusion {underextruding_detected}\n"
@@ -830,18 +931,48 @@ class HighResolutionFilamentSensor:
         msg += f"- smallest detectable movement: {self.detectable_distance_change()} mm\n"
         gcmd.respond_info(msg)
 
+    def _open_serial(self):
+        """ Open the configured port, claiming it exclusively where the
+        platform supports it.
+
+        Nothing else may share this port. A second process reading the same
+        CDC device - a firmware updater asking the board for its INFO, say -
+        does not get its own stream: writes interleave and whichever side
+        reads first consumes the other's reply, so both see intermittent
+        garbage rather than an error. TIOCEXCL turns that into a plain EBUSY
+        for the second opener instead. It is a guard against accident, not a
+        guarantee: root bypasses it.
+
+        `exclusive` is a posix-only pyserial argument added in 3.3, and
+        passing it elsewhere raises rather than being ignored - so fall back
+        to a plain open instead of refusing to start on a platform or a
+        pyserial that cannot do it.
+        """
+        kwargs = {"timeout": 0.05, "write_timeout": 0.05}
+        try:
+            return serial.Serial(self.serial_port, self.baud,
+                                 exclusive=True, **kwargs)
+        except TypeError:
+            logging.info("%s: pyserial does not support exclusive access on "
+                         "this platform, opening %s unlocked",
+                         self.name, self.serial_port)
+            return serial.Serial(self.serial_port, self.baud, **kwargs)
+
     def _handle_connect(self):
         """ Connect the serial port, if necessary. """
         try:
             if self.serial_port:
-                ser = serial.Serial(self.serial_port, self.baud, timeout=0.05, write_timeout=0.05)
+                ser = self._open_serial()
                 self.regs = RegisterReaderSerial(ser)
                 # Resolved once, here, because the configured path is usually a
                 # /dev/serial/by-id symlink and what a host tool matches against
                 # is the device it points at.
                 self._device_path = os.path.realpath(self.serial_port)
-        except serial.SerialException:
-            raise self.printer.config_error(f"{self.name}: Could not connect to {self.serial_port}")
+        except serial.SerialException as e:
+            # EBUSY here most often means something else already has the port:
+            # another Klipper instance, or a host tool that did not let go.
+            raise self.printer.config_error(
+                f"{self.name}: Could not connect to {self.serial_port}: {e}")
 
     def setup_buttons(self, prefix, klass):
         """ Register virtual buttons for use with filament_motion_sensor and filament_switch_sensor. """
@@ -921,6 +1052,8 @@ class HighResolutionFilamentSensor:
 
         identity = self._identity.get_status() if self._identity \
             else SensorIdentity.unknown_status()
+        firmware_image = self._firmware_image.get_status() \
+            if self._firmware_image else FirmwareImage.unknown_status()
 
         return {
             "enabled": bool(self.runout_helper.sensor_enabled),
@@ -930,6 +1063,11 @@ class HighResolutionFilamentSensor:
             # descriptor, and `connection.device_path` against the port it
             # enumerated at.
             "identity": identity,
+            # Which build this board is running, as a digest of the bytes it
+            # is executing. A host tool compares it against the same byte
+            # range extracted from the .uf2 it believes it flashed - see
+            # scripts/uf2_image_digest.py.
+            "firmware_image": firmware_image,
             "connection": {
                 "port": self.serial_port,
                 "device_path": self._device_path,
@@ -997,6 +1135,7 @@ class HighResolutionFilamentSensor:
             # away - it may have been swapped, reflashed or provisioned while
             # it was gone. Drop the cached identity and ask again.
             self._identity = None
+            self._firmware_image = None
             self._identity_next_attempt = 0.
         if new_value:
             self._respond_info("Reconnected")
@@ -1028,21 +1167,37 @@ class HighResolutionFilamentSensor:
         Failure here is never fatal. A board that will not say who it is still
         reports filament, and taking Klippy down over a blank status field
         would be a far worse outcome than the blank field. """
-        if self._identity is not None or eventtime < self._identity_next_attempt:
+        if (self._identity is not None and self._firmware_image is not None) \
+                or eventtime < self._identity_next_attempt:
             return
 
         self._identity_next_attempt = eventtime + IDENTITY_RETRY_TIMEOUT
         try:
-            identity = self.regs.read_identity()
+            identity = self.regs.read_identity() if self._identity is None \
+                else self._identity
         except Exception:
             logging.exception(f"{self.name}: reading the identity registers failed")
             return
 
         if identity is None:
+            # The board is not answering the window at all. Reading the image
+            # registers now would only add failures to the same retry.
             return
 
-        self._identity = identity
-        logging.info(f"{self.name}: identity {identity!r}")
+        if self._identity is None:
+            self._identity = identity
+            logging.info(f"{self.name}: identity {identity!r}")
+
+        if self._firmware_image is None:
+            try:
+                image = self.regs.read_firmware_image()
+            except Exception:
+                logging.exception(
+                    f"{self.name}: reading the image digest registers failed")
+                image = None
+            if image is not None:
+                self._firmware_image = image
+                logging.info(f"{self.name}: firmware image {image!r}")
 
         if not identity.provisioned:
             # The one thing this whole window exists to make sayable: the

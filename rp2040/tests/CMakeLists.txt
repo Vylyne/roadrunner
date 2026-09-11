@@ -8,6 +8,7 @@ add_executable(roadrunner_identity_tests
     test_identity_record.c
     ../identity_record.c
     ../identity_store.c
+    ../image_digest.c
     ../usb_admin.c
     ../usb_descriptor_strings.c
 )
@@ -19,11 +20,24 @@ add_executable(roadrunner_identity_register_tests
     test_identity_registers.c
     ../identity_registers.c
     ../identity_record.c
+    ../image_digest.c
     ../usb_descriptor_strings.c
 )
 target_include_directories(roadrunner_identity_register_tests PRIVATE ..)
 
 add_test(NAME identity_registers COMMAND roadrunner_identity_register_tests)
+
+# The image digest, checked off-target against the golden vector in
+# docs/roadrunner-usb-admin-protocol.md. The board-side and host-side
+# implementations each test against the document; they never test against
+# each other, which is what keeps them from agreeing on a wrong number.
+add_executable(roadrunner_image_digest_tests
+    test_image_digest.c
+    ../image_digest.c
+)
+target_include_directories(roadrunner_image_digest_tests PRIVATE ..)
+
+add_test(NAME image_digest COMMAND roadrunner_image_digest_tests)
 
 # The I2C target's register-serving state machine, driven off-target.
 #
@@ -46,6 +60,7 @@ set(ROADRUNNER_STDIO_USB_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../identity_record.c
     ${CMAKE_CURRENT_LIST_DIR}/../identity_registers.c
     ${CMAKE_CURRENT_LIST_DIR}/../identity_store.c
+    ${CMAKE_CURRENT_LIST_DIR}/../image_digest.c
     ${CMAKE_CURRENT_LIST_DIR}/../ir_sensor.c
     ${CMAKE_CURRENT_LIST_DIR}/../neopixel.c
     ${CMAKE_CURRENT_LIST_DIR}/../tmcuart.c

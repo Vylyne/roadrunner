@@ -1,5 +1,6 @@
 #include "identity_record.h"
 #include "identity_store.h"
+#include "image_digest.h"
 #include "usb_admin.h"
 #include "usb_descriptor_strings.h"
 #include <assert.h>
@@ -336,10 +337,24 @@ static void test_usb_admin_requires_clear_confirmation(void) {
     assert(memcmp(memory.sector, before, sizeof(before)) == 0);
 }
 
+/* docs/roadrunner-usb-admin-protocol.md, "Golden vector": 600 bytes at
+ * 0x10000000 where byte i is (i * 7 + 3) & 0xff, digesting to 0xbbe38aa9. */
+#define GOLDEN_IMAGE_START 0x10000000u
+#define GOLDEN_IMAGE_LENGTH 600u
+
+static uint8_t golden_image[GOLDEN_IMAGE_LENGTH];
+
+static void install_golden_image(void) {
+    for (size_t index = 0; index < GOLDEN_IMAGE_LENGTH; ++index) {
+        golden_image[index] = (uint8_t)((index * 7u + 3u) & 0xffu);
+    }
+    rr_image_digest_init(golden_image, GOLDEN_IMAGE_START, GOLDEN_IMAGE_LENGTH);
+}
+
 static void test_usb_admin_info_frame(void) {
     static const uint8_t request[] = {0x52, 0x52, 0x01, 0x01, 0x00, 0x90};
     static const uint8_t expected_response[] = {
-        0x52, 0x52, 0x01, 0x81, 0x3c,
+        0x52, 0x52, 0x01, 0x81, 0x4a,
         0x00, 0x01, 0x03, 0x02, 0x0d,
         0x72, 0x6f, 0x61, 0x64, 0x72, 0x75, 0x6e, 0x6e, 0x65, 0x72,
         0x2d, 0x76, 0x31,
@@ -349,7 +364,15 @@ static void test_usb_admin_info_frame(void) {
         0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
         0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
         0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0xab,
+        /* algorithm CRC-32/ISO-HDLC, four digest bytes, then the digest,
+         * image start and image length - all little-endian. The digest is
+         * labelled rather than bare so two implementations cannot quietly
+         * compare numbers produced by different functions. */
+        0x01, 0x04,
+        0xa9, 0x8a, 0xe3, 0xbb,
+        0x00, 0x00, 0x00, 0x10,
+        0x58, 0x02, 0x00, 0x00,
+        0x2f,
     };
     struct rr_identity identity = {0};
     static const uint8_t flash_uid[RR_USB_ADMIN_FLASH_UID_SIZE] = {
@@ -371,6 +394,7 @@ static void test_usb_admin_info_frame(void) {
         .reboot_bootsel = usb_admin_test_reboot_bootsel,
     };
 
+    install_golden_image();
     rr_usb_admin_init(&config);
     for (size_t index = 0; index < sizeof(request); ++index) {
         rr_usb_admin_receive(request[index]);
@@ -379,6 +403,56 @@ static void test_usb_admin_info_frame(void) {
     assert(io.legacy_length == 0);
     assert(io.response_length == sizeof(expected_response));
     assert(memcmp(io.response, expected_response, sizeof(expected_response)) == 0);
+}
+
+/* A board that cannot compute a digest must say so with the algorithm byte.
+ * Reporting 0x00000000 instead would be a legal CRC value, and a host would
+ * compare it against a real one and conclude the board is running the wrong
+ * build. */
+static void test_usb_admin_info_frame_without_a_digest(void) {
+    static const uint8_t request[] = {0x52, 0x52, 0x01, 0x01, 0x00, 0x90};
+    struct rr_identity identity = {0};
+    static const uint8_t flash_uid[RR_USB_ADMIN_FLASH_UID_SIZE] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    };
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = {
+        .identity_status = RR_IDENTITY_OK,
+        .identity = &identity,
+        .flash_uid = flash_uid,
+        .transport = RR_USB_ADMIN_TRANSPORT_USB,
+        .led_order = RR_USB_ADMIN_LED_GRB,
+        .firmware_version = "dev",
+        .context = &io,
+        .write = usb_admin_test_write,
+        .legacy_byte = usb_admin_test_legacy_byte,
+        .flush = usb_admin_test_flush,
+        .transmit_complete = usb_admin_test_transmit_complete,
+        .reboot_bootsel = usb_admin_test_reboot_bootsel,
+    };
+    size_t payload_start = 5u;
+    size_t digest_field;
+
+    rr_image_digest_init(NULL, GOLDEN_IMAGE_START, GOLDEN_IMAGE_LENGTH);
+    rr_usb_admin_init(&config);
+    for (size_t index = 0; index < sizeof(request); ++index) {
+        rr_usb_admin_receive(request[index]);
+    }
+
+    /* Everything up to the flash UID is unchanged, so locate the digest
+     * fields from the end: algorithm, zero length, then the two 32-bit range
+     * fields and the frame CRC. */
+    digest_field = io.response_length - 1u - 8u - 2u;
+    assert(io.response[payload_start] == RR_USB_ADMIN_OK);
+    assert(io.response[digest_field] == RR_IMAGE_DIGEST_NONE);
+    assert(io.response[digest_field + 1u] == 0u);
+    /* The range is still reported: a host needs to know which bytes a digest
+     * obtained elsewhere would have to cover. */
+    assert(io.response[digest_field + 2u] == 0x00u);
+    assert(io.response[digest_field + 5u] == 0x10u);
+    assert(io.response[digest_field + 6u] == 0x58u);
+
+    install_golden_image();
 }
 
 static void test_usb_admin_preserves_legacy_register_traffic(void) {
@@ -682,6 +756,7 @@ int main(void) {
     assert(strcmp(descriptor_strings.serial,
                   "RR-UNPROVISIONED-0123456789ABCDEF") == 0);
     test_usb_admin_info_frame();
+    test_usb_admin_info_frame_without_a_digest();
     test_usb_admin_preserves_legacy_register_traffic();
     test_usb_admin_rejects_bad_crc();
     test_usb_admin_acknowledges_before_bootsel_reboot();

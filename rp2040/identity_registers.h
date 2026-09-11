@@ -2,6 +2,7 @@
 #define IDENTITY_REGISTERS_H
 
 #include "identity_record.h"
+#include "image_digest.h"
 #include "usb_descriptor_strings.h"
 
 #include <stdbool.h>
@@ -9,7 +10,7 @@
 #include <stdint.h>
 
 /* The identity window. Chosen to clear the sensor map, which uses 0x10 and
- * 0x20-0x24 (0x20 is reserved for the commented-out READ_HEALTH). These five
+ * 0x20-0x24 (0x20 is reserved for the commented-out READ_HEALTH). These
  * registers are readable whether or not the board is provisioned - they are
  * both the unprovisioned allow-list and the steady-state identity source.
  * Field order mirrors the USB admin INFO payload deliberately, so
@@ -21,6 +22,11 @@ enum {
     RR_REG_FIRMWARE_VERSION = 0x32,
     RR_REG_VARIANT = 0x33,
     RR_REG_FLASH_UID = 0x34,
+    /* Not identity, but the same window and the same rule: readable whether
+     * or not the board is provisioned, because "which build is this" is a
+     * question you most need answered about a board that is refusing. */
+    RR_REG_IMAGE_DIGEST = 0x35,
+    RR_REG_IMAGE_RANGE = 0x36,
 };
 
 /* RR_USB_SERIAL_MAX_LENGTH is 34; the longest real serial,
@@ -30,6 +36,13 @@ enum {
 #define RR_REG_FIRMWARE_VERSION_SIZE 32u
 #define RR_REG_VARIANT_SIZE 2u
 #define RR_REG_FLASH_UID_SIZE RR_USB_FLASH_UID_SIZE
+/* Four bytes is the Klipper tmcuart ceiling, so 0x35 is fixed to one
+ * algorithm by its definition instead of spending a byte labelling it - that
+ * is what lets a UART host read the digest at all. A different algorithm
+ * would take a different register number. 0x36 is eight bytes and is out of
+ * reach over UART. */
+#define RR_REG_IMAGE_DIGEST_SIZE RR_IMAGE_DIGEST_SIZE
+#define RR_REG_IMAGE_RANGE_SIZE RR_IMAGE_RANGE_SIZE
 
 struct rr_identity_registers_config {
     rr_identity_status_t identity_status;

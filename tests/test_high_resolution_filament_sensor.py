@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import struct
 import sys
 import types
 from pathlib import Path
@@ -109,14 +110,19 @@ class RecordingReader:
 
 
 def _identity_payloads(module, state=1, serial=b"RR-0001", version=b"v1.2.3",
-                       transport=3, led_order=2):
+                       transport=3, led_order=2, digest=0xBBE38AA9,
+                       image_start=0x10000000, image_length=600):
     reg = module.IdentityRegister
-    return {
+    payloads = {
         reg.STATE: bytes([state]),
         reg.SERIAL: serial.ljust(reg.SIZES[reg.SERIAL], b"\x00"),
         reg.FIRMWARE_VERSION: version.ljust(reg.SIZES[reg.FIRMWARE_VERSION], b"\x00"),
         reg.VARIANT: bytes([transport, led_order]),
     }
+    if digest is not None:
+        payloads[reg.IMAGE_DIGEST] = struct.pack("<L", digest)
+        payloads[reg.IMAGE_RANGE] = struct.pack("<LL", image_start, image_length)
+    return payloads
 
 
 def test_identity_read_strips_nul_padding_and_decodes_variant(monkeypatch):
@@ -244,6 +250,19 @@ def test_serial_reader_frames_a_register_longer_than_read_all(monkeypatch):
     assert reader.buffer == b""
 
 
+def _generic_reader(module, payloads):
+    """A RecordingReader wired to the generic reader's own register logic."""
+
+    class Reader(RecordingReader):
+        identity_registers = module.RegisterReaderGeneric.identity_registers
+        image_registers = module.RegisterReaderGeneric.image_registers
+        read_identity = module.RegisterReaderGeneric.read_identity
+        read_firmware_image = module.RegisterReaderGeneric.read_firmware_image
+        decode_all = module.RegisterReaderGeneric.decode_all
+
+    return Reader(module, payloads)
+
+
 def _bare_sensor(module, reader):
     """A sensor with only the attributes the identity path touches.
 
@@ -254,6 +273,7 @@ def _bare_sensor(module, reader):
     sensor.name = "roadrunner"
     sensor.regs = reader
     sensor._identity = None
+    sensor._firmware_image = None
     sensor._identity_next_attempt = 0.
     sensor.errors = []
     sensor._respond_error = sensor.errors.append
@@ -264,33 +284,26 @@ def test_identity_is_read_once_not_on_every_sensor_poll(monkeypatch):
     """34 bytes over a clock-stretching I2C bus has no place in a 100ms loop."""
     module = _load_extra(monkeypatch)
 
-    class Reader(RecordingReader):
-        identity_registers = module.RegisterReaderGeneric.identity_registers
-        read_identity = module.RegisterReaderGeneric.read_identity
-
-    reader = Reader(module, _identity_payloads(module))
+    reader = _generic_reader(module, _identity_payloads(module))
     sensor = _bare_sensor(module, reader)
 
     for tick in range(20):
         sensor._update_identity(tick * 0.1)
-    # Past the retry timer too: that timer paces failures, and a success has
-    # nothing left to retry.
+    # Well past the retry timer: a cache that is not a cache re-reads here.
     sensor._update_identity(module.IDENTITY_RETRY_TIMEOUT * 10)
 
-    assert [reg for reg, _ in reader.reads] == list(
-        module.RegisterReaderGeneric.identity_registers)
+    assert [reg for reg, _ in reader.reads] == \
+        list(module.RegisterReaderGeneric.identity_registers) \
+        + list(module.RegisterReaderGeneric.image_registers)
     assert sensor._identity.serial == "RR-0001"
+    assert sensor._firmware_image.digest == 0xBBE38AA9
 
 
 def test_a_failed_identity_read_retries_on_a_slow_timer(monkeypatch):
     """Retry, but not at the poll rate, and never by raising."""
     module = _load_extra(monkeypatch)
 
-    class Reader(RecordingReader):
-        identity_registers = module.RegisterReaderGeneric.identity_registers
-        read_identity = module.RegisterReaderGeneric.read_identity
-
-    reader = Reader(module, {})
+    reader = _generic_reader(module, {})
     sensor = _bare_sensor(module, reader)
 
     for tick in range(20):
@@ -306,11 +319,7 @@ def test_an_unprovisioned_board_says_why_instead_of_looking_dead(monkeypatch):
     """The whole point of the window: answering, and refusing on purpose."""
     module = _load_extra(monkeypatch)
 
-    class Reader(RecordingReader):
-        identity_registers = module.RegisterReaderGeneric.identity_registers
-        read_identity = module.RegisterReaderGeneric.read_identity
-
-    reader = Reader(module, _identity_payloads(module, state=0))
+    reader = _generic_reader(module, _identity_payloads(module, state=0))
     sensor = _bare_sensor(module, reader)
     sensor._update_identity(0.)
 
@@ -340,7 +349,9 @@ def test_a_locked_board_explains_itself_instead_of_looking_dead(monkeypatch):
 
     class Reader(RecordingReader):
         identity_registers = module.RegisterReaderGeneric.identity_registers
+        image_registers = module.RegisterReaderGeneric.image_registers
         read_identity = module.RegisterReaderGeneric.read_identity
+        read_firmware_image = module.RegisterReaderGeneric.read_firmware_image
         decode_all = module.RegisterReaderGeneric.decode_all
 
         def read(self):
@@ -380,3 +391,200 @@ def test_a_locked_board_explains_itself_instead_of_looking_dead(monkeypatch):
     assert status["identity"]["provisioned"] is False
     assert status["connection"]["device_path"] == "/dev/ttyACM0"
     assert status["connection"]["consecutive_failures"] == 1
+
+
+def test_the_digest_is_reported_with_its_algorithm_never_bare(monkeypatch):
+    """A bare number is the failure this shape exists to prevent.
+
+    Two sides comparing digests computed by different functions agree on the
+    field and disagree on the value forever, and nobody can tell why.
+    """
+    module = _load_extra(monkeypatch)
+
+    reader = _generic_reader(module, _identity_payloads(module))
+    image = module.RegisterReaderGeneric.read_firmware_image(reader)
+
+    assert image.get_status() == {
+        "algorithm": "crc32-iso-hdlc",
+        "digest": "0xbbe38aa9",
+        "start": 0x10000000,
+        "length": 600,
+    }
+
+
+def test_the_digest_matches_the_protocol_documents_golden_vector(monkeypatch):
+    """The board's number and the host's number come from the same document.
+
+    This is the same vector as tests/test_uf2_image_digest.py, checked from
+    the other side: a 600-byte image whose CRC-32/ISO-HDLC the spec fixes at
+    0xBBE38AA9. If the two files disagree, one of them has drifted from the
+    document rather than from the other.
+    """
+    module = _load_extra(monkeypatch)
+
+    reader = _generic_reader(module, _identity_payloads(module))
+    image = module.RegisterReaderGeneric.read_firmware_image(reader)
+
+    assert image.digest == 0xBBE38AA9
+    assert (image.start, image.length) == (0x10000000, 600)
+
+
+def test_unknown_firmware_image_has_the_same_keys_as_a_real_one(monkeypatch):
+    """A key that appears late is a key a Moonraker subscriber never sees."""
+    module = _load_extra(monkeypatch)
+
+    reader = _generic_reader(module, _identity_payloads(module))
+    real = module.RegisterReaderGeneric.read_firmware_image(reader).get_status()
+
+    assert module.FirmwareImage.unknown_status().keys() == real.keys()
+    assert module.FirmwareImage.unknown_status()["digest"] is None
+    assert module.FirmwareImage.unknown_status()["algorithm"] is None
+
+
+def test_a_board_without_a_digest_reports_nothing_rather_than_zero(monkeypatch):
+    """0x00000000 is a legal digest, so a missing read must not look like one."""
+    module = _load_extra(monkeypatch)
+
+    payloads = _identity_payloads(module)
+    del payloads[module.IdentityRegister.IMAGE_DIGEST]
+    reader = _generic_reader(module, payloads)
+
+    assert module.RegisterReaderGeneric.read_firmware_image(reader) is None
+
+
+def test_an_unreadable_range_keeps_the_digest_it_did_read(monkeypatch):
+    """The range is best-effort; the digest is the anchor."""
+    module = _load_extra(monkeypatch)
+
+    payloads = _identity_payloads(module)
+    del payloads[module.IdentityRegister.IMAGE_RANGE]
+    reader = _generic_reader(module, payloads)
+
+    image = module.RegisterReaderGeneric.read_firmware_image(reader)
+    assert image.digest == 0xBBE38AA9
+    assert image.start is None
+    assert image.length is None
+
+
+def test_uart_reads_the_digest_but_never_the_range(monkeypatch):
+    """Four bytes fit the tmcuart buffer; the eight-byte range register does not.
+
+    Asking for the range over UART is not a failed read - it is
+    shutdown("tmcuart data too large"), which takes the printer down.
+    """
+    module = _load_extra(monkeypatch)
+
+    class Uart:
+        def __init__(self):
+            self.reads = []
+
+        def reg_read(self, _instance_id, addr, reg, reg_length=4):
+            self.reads.append((reg, reg_length))
+            return struct.pack("<L", 0xBBE38AA9)
+
+    uart = Uart()
+    reader = module.RegisterReaderUART(uart)
+    image = reader.read_firmware_image()
+
+    assert [reg for reg, _ in uart.reads] == [module.IdentityRegister.IMAGE_DIGEST]
+    assert image.digest == 0xBBE38AA9
+    assert image.start is None
+    assert image.length is None
+    assert all(length <= module.RegisterReaderUART.MAX_REGISTER_LENGTH
+               for _, length in uart.reads)
+
+
+def test_a_failed_digest_read_retries_without_re_reading_the_identity(monkeypatch):
+    """Identity is 34 bytes over a slow bus; do not pay for it twice."""
+    module = _load_extra(monkeypatch)
+
+    payloads = _identity_payloads(module)
+    del payloads[module.IdentityRegister.IMAGE_DIGEST]
+    reader = _generic_reader(module, payloads)
+    sensor = _bare_sensor(module, reader)
+
+    sensor._update_identity(0.)
+    assert sensor._identity is not None
+    assert sensor._firmware_image is None
+
+    reader.reads.clear()
+    reader.payloads[module.IdentityRegister.IMAGE_DIGEST] = struct.pack("<L", 7)
+    sensor._update_identity(module.IDENTITY_RETRY_TIMEOUT + 1.)
+
+    assert [reg for reg, _ in reader.reads] == list(
+        module.RegisterReaderGeneric.image_registers)
+    assert sensor._firmware_image.digest == 7
+
+
+def test_a_reconnect_drops_the_cached_digest_with_the_identity(monkeypatch):
+    """The board that came back may have been reflashed while it was gone."""
+    module = _load_extra(monkeypatch)
+
+    reader = _generic_reader(module, _identity_payloads(module))
+    sensor = _bare_sensor(module, reader)
+    sensor.infos = []
+    sensor._respond_info = lambda msg, log=False: sensor.infos.append(msg)
+    sensor._update_identity(0.)
+    assert sensor._firmware_image is not None
+
+    sensor._sensor_connected_changed(False, True, 0.)
+
+    assert sensor._identity is None
+    assert sensor._firmware_image is None
+
+
+def _opener(module):
+    """A sensor stripped to just what _open_serial reads."""
+    sensor = object.__new__(module.HighResolutionFilamentSensor)
+    sensor.name = "roadrunner"
+    sensor.serial_port = "/dev/serial/by-id/usb-Roadrunner"
+    sensor.baud = 115200
+    return sensor
+
+
+def test_the_serial_port_is_claimed_exclusively(monkeypatch):
+    """Klipper must not share the port with a host tool.
+
+    Two processes on one CDC device do not get two streams: writes interleave
+    and whichever reads first eats the other's reply, so both sides see
+    intermittent garbage instead of an error. TIOCEXCL makes the second
+    opener fail with EBUSY, which is a diagnosis rather than a mystery.
+    """
+    module = _load_extra(monkeypatch)
+    calls = []
+
+    class FakeSerial:
+        def __init__(self, port, baud, **kwargs):
+            calls.append((port, baud, kwargs))
+
+    monkeypatch.setattr(module.serial, "Serial", FakeSerial, raising=False)
+    _opener(module)._open_serial()
+
+    assert len(calls) == 1
+    port, baud, kwargs = calls[0]
+    assert port == "/dev/serial/by-id/usb-Roadrunner"
+    assert baud == 115200
+    assert kwargs["exclusive"] is True
+
+
+def test_a_pyserial_without_exclusive_still_connects(monkeypatch, caplog):
+    """`exclusive` is posix-only and pyserial 3.3+; older or other platforms
+    raise rather than ignore it. Losing the lock is worth reporting, not worth
+    refusing to start a printer over."""
+    module = _load_extra(monkeypatch)
+    calls = []
+
+    class FakeSerial:
+        def __init__(self, port, baud, **kwargs):
+            if "exclusive" in kwargs:
+                raise TypeError("unexpected keyword argument 'exclusive'")
+            calls.append(kwargs)
+
+    monkeypatch.setattr(module.serial, "Serial", FakeSerial, raising=False)
+    with caplog.at_level(logging.INFO):
+        assert _opener(module)._open_serial() is not None
+
+    assert len(calls) == 1
+    assert "exclusive" not in calls[0]
+    assert any("exclusive access" in message for message in caplog.messages)
+
