@@ -74,6 +74,14 @@ extra's on-connect path — every route above ultimately goes over USB.
   (accepted, unimplemented): serve the identity window in four-byte chunks.
   The alternative is the extra's planned on-connect USB admin path.
 
+- [ ] Provision an unprovisioned board from Klipper instead of from a
+  workstation. A board wired for I2C or UART has no USB host attached, so
+  setting its identity today means unplugging it. Specced in
+  [docs/roadrunner-sensor-bus-provisioning-design.md](docs/roadrunner-sensor-bus-provisioning-design.md)
+  (proposed, unimplemented): staged UUID chunks plus a CRC-checked commit,
+  accepted only while the board is locked, so a provisioned board refuses every
+  write on the sensor bus.
+
 Most 3D printer motion sensors are bulky, slow to trigger, prone to false positives, and have a high detection distance meaning a large amount material is extruded before actually detecting a runout, leading to poor layer adhesion and failed prints after a runout.
 
 The Roadrunner motion sensor is based on a magnetic rotary encoder which can detect sub-millimeter movement in the filament for accurate extrusion length measurement, in addition to an IR sensor which can instantly detect filament runout. With the combination of both sensors and a dedicated RP2040-Zero board for collecting data, the Roadrunner can detect which type of issue is affecting a print, between simply reaching the end of a spool, the filament no longer moving, or the filament moving but at a lower than expected rate of extrusion.
