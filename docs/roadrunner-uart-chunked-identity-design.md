@@ -65,26 +65,24 @@ sentence, and three disjoint ranges would make it three.
 | Registers | Field | Chunks | Field size | Notes |
 |---|---|---|---|---|
 | `0x30`–`0x36` | existing window | — | — | unchanged |
-| `0x37`–`0x3F` | SERIAL | 0–8 | 34 | last chunk carries 2 bytes + 2 zero |
+| `0x37`–`0x3E` | SERIAL | 0–7 | 32 | exact fit; see the amendment below |
+| `0x3F` | — | — | — | reserved, freed by the amendment |
 | `0x40`–`0x47` | FIRMWARE_VERSION | 0–7 | 32 | exact fit |
 | `0x48`–`0x49` | IMAGE_RANGE | 0–1 | 8 | chunk 0 = `start`, chunk 1 = `length` |
 
 Every chunk register returns exactly 4 bytes. A chunk index past a field's
 last chunk is not assigned and is refused like any unassigned register.
 
-**No FLASH_UID chunks — but not because the UID is withheld.** It is not.
-An unprovisioned board's serial *is* the flash UID: `rr_usb_descriptor_strings_build`
-renders `RR-UNPROVISIONED-` followed by all eight bytes in uppercase hex, so
-the SERIAL chunks carry it in full. `0x30` already does the same over I2C, and
-so does the USB descriptor. That exposure is deliberate — a board you have not
-yet provisioned needs some handle by which to address it.
+**No FLASH_UID chunks.** Hosts must not persist the flash UID, and a bare
+eight-byte register reads like a field worth keeping.
 
-`0x34` stays off the chunk list for a different reason: presentation. The rule
-that matters is *do not persist the flash UID as an identity*, because
-RP2040 flash-derived serials are not unique. `RR-UNPROVISIONED-` is a loud,
-self-labelling prefix that tells a host exactly what it is holding. A bare
-eight-byte register carries no such label and reads like a field worth
-keeping. Same bytes, opposite invitation.
+This was nearly a distinction without a difference. Until the amendment below,
+an unprovisioned board's serial *was* the flash UID — `RR-UNPROVISIONED-`
+followed by all eight bytes in hex — so chunking SERIAL would have carried it
+in full regardless, as `0x30` already does over I2C and as the USB descriptor
+already does. Removing the suffix is what makes this carve-out mean something:
+with it gone, the UID is reachable only at `0x34` and over USB admin INFO, and
+travels no sensor bus at all.
 
 **Where the window cannot grow.** Klipper's `tmc_uart` sets bit 7 of the
 register byte to mean write, so the readable register space ends at `0x7F`,
@@ -126,7 +124,7 @@ and `read_firmware_image` in `RegisterReaderGeneric` are untouched, and
 full tuples.
 
 **Retries stay per chunk**, never per field. One flaky slice must not restart
-the other eight.
+the other seven.
 
 **Stop at the first NUL — text fields only.** SERIAL and FIRMWARE_VERSION are
 NUL-padded strings, so a chunk containing a terminator is the last chunk worth
@@ -141,8 +139,8 @@ unlike SERIAL, where every byte of the encoded UUID is significant.
 
 | Field | Chunks allocated | Typical chunks read |
 |---|---|---|
-| SERIAL, provisioned (29 chars) | 9 | 8 |
-| SERIAL, unprovisioned (33 chars) | 9 | 9 |
+| SERIAL, provisioned (29 chars) | 8 | 8 |
+| SERIAL, unprovisioned (16 chars) | 8 | 4 |
 | FIRMWARE_VERSION, `dev` | 8 | 1 |
 | FIRMWARE_VERSION, `v0.3.1-12-gab34cd7` | 8 | 5 |
 | IMAGE_RANGE | 2 | 2 |
@@ -153,8 +151,9 @@ the same trap the protocol doc already names for the digest, where a zero CRC
 is a real CRC and "no digest" had to be signalled some other way. Both chunks
 are always read in full.
 
-**Pacing.** A full identity read is 20 chunk transactions worst case, 11-15
-typical with early stop, each with up to 5 retries. They must not all land in one sensor-poll callback. The reader
+**Pacing.** A full identity read is 18 chunk transactions worst case, and 7-14
+typical with early stop — 7 for the unprovisioned board that the provisioning
+flow most needs to read quickly, each with up to 5 retries. They must not all land in one sensor-poll callback. The reader
 carries a per-attempt budget measured in chunks, keeps successfully-read
 chunks in an accumulator between attempts, and completes the field across
 several polls. `_update_identity` already has a retry timer and caches, so
@@ -165,7 +164,7 @@ this is a bounded amount of new state.
 
 ## Tearing
 
-Can an identity change between chunk 0 and chunk 8?
+Can an identity change between the first chunk and the last?
 
 No, on current firmware. Both commands that can change it — `PROVISION_UUID`
 and `CLEAR_IDENTITY` in `rp2040/usb_admin.c` — acknowledge and then reboot the
@@ -174,7 +173,7 @@ goes away, the in-flight chunk reads fail, and the reconnect path discards the
 accumulator. A torn assembly is not reachable.
 
 This is load-bearing: it is what makes keeping partial chunks across polls
-safe, which is what lets a 9-chunk serial converge on a marginal bus. **If a
+safe, which is what lets a multi-chunk serial converge on a marginal bus. **If a
 future change ever lets an identity change without a reboot, this decision
 must be revisited** — the fix then is a one-byte generation counter in the
 window, read before and after the sequence, not a re-read of chunk 0 (chunk 0
@@ -214,39 +213,98 @@ and Moonraker persists printer objects. A transient diagnostic handle is
 therefore already being written somewhere durable. Worth closing as part of the
 provisioning work.
 
+## Amendment: drop the flash UID from the unprovisioned serial
+
+Accepted 2026-09-12, alongside this design. A blank board renders its serial as
+exactly `RR-UNPROVISIONED`, with no hex suffix, identically on I2C, UART and the
+USB descriptor.
+
+**The suffix buys no distinctness.** `roadrunner-identity-gate-design.md`
+hazard 1 records it, confirmed on hardware: two Roadrunners from the same batch
+return the same `pico_get_unique_board_id()`, so their `RR-UNPROVISIONED-<uid>`
+serials already collide and so do their `/dev/serial/by-id` symlinks. udev
+creates one. mcu-updater's `_entry_candidates()` lists that directory by name
+and therefore sees one board, and its "refuse ambiguous matches" guard never
+fires because no ambiguity is visible.
+
+That makes the suffix worse than useless. It simulates uniqueness it does not
+have, turning a collision that would be obvious into one that is hidden.
+
+Nothing real is lost by removing it:
+
+- **Distinctness** was already absent.
+- **Addressing** never used it. `roadrunner-provisioning-design.md` states the
+  UID is never used to select a write, `AGENTS.md` makes USB topology the
+  transient handoff key, and the gate's *unprovisioned implies not live*
+  invariant means there is no live board to mis-address.
+- **Diagnostics** keep it. The UID is still readable at `0x34` and in USB admin
+  INFO. It simply stops being baked into the displayed serial, and so stops
+  travelling the sensor bus at all — which retires the exposure discussed under
+  "No FLASH_UID chunks" rather than managing it.
+
+`RR-UNPROVISIONED` is 16 characters, exactly four chunks with no padding:
+
+| Chunk | Register | Bytes |
+|---|---|---|
+| 0 | `0x37` | `RR-U` |
+| 1 | `0x38` | `NPRO` |
+| 2 | `0x39` | `VISI` |
+| 3 | `0x3A` | `ONED` |
+
+The widest serial becomes the provisioned form at 29 characters, so:
+
+- `RR_USB_SERIAL_MAX_LENGTH` and `RR_REG_SERIAL_SIZE` drop from 34 to 32.
+- SERIAL takes 8 chunks, `0x37`–`0x3E`. `0x3F` is freed; the window's other
+  allocations are unchanged.
+- An unprovisioned board costs 4 chunk reads with early stop, not 9.
+
+**Rejected: a sentinel value** such as all-`0xFF` or all-zero in place of the
+text. `0xFF` is already the gate's filler for a refused register, so a sentinel
+serial would be ambiguous with a refusal, and it needs a decode rule on every
+host. The spelled word is self-describing on every transport and needs none.
+
+This is a wire-format change and reaches beyond this document. At implementation
+time it also requires:
+
+- `rr_usb_descriptor_strings_build` to stop appending the hex UID, and the
+  `RR_USB_SERIAL_MAX_LENGTH` change in `rp2040/usb_descriptor_strings.h`.
+- `roadrunner-provisioning-design.md`, "Identity presentation" — the sentence
+  describing `RR-UNPROVISIONED-` followed by the flash UID in hex.
+- `roadrunner-usb-admin-protocol.md` — the same description near the INFO
+  serial text, and the `34` widths in its register table.
+- `roadrunner-identity-gate-design.md` — hazard 1 keeps its history but gains a
+  note that the suffix was removed, and the `0x31` row's `34`/`33` lengths.
+- Hosts that match on the prefix keep working; hosts that parse the suffix do
+  not, which is the intended breakage.
+
 ## Serial length — is a shorter serial worth it?
 
-Asked directly: dropping the `RR-` prefix saves one chunk out of nine. The
-arithmetic, since the chunk count is driven by the *widest* form the register
-must hold, not by the typical one:
+The question that led to the amendment above: is the `RR-` prefix worth its
+three bytes? The arithmetic matters because the chunk count is driven by the
+*widest* form the register must hold, not by the typical one.
 
-| Form | Today | Without `RR-` |
-|---|---|---|
-| Provisioned (`RR-` + 26 Crockford base32) | 29 | 26 |
-| Unprovisioned (`RR-UNPROVISIONED-` + 16 hex) | 33 | 30 |
-| Register width | 34 | 32 |
-| Chunks | 9 | 8 |
+| Form | Before | After the amendment | Also dropping `RR-` |
+|---|---|---|---|
+| Provisioned (`RR-` + 26 Crockford base32) | 29 | 29 | 26 |
+| Unprovisioned | 33 | 16 | 13 |
+| Register width | 34 | 32 | 28 |
+| Chunks | 9 | 8 | 7 |
 
-So it is real but small: one transaction saved out of twenty, and the width
-only drops to 32 because the unprovisioned form — not the identity itself —
-sets the ceiling. The cost is not small: `RR-` is the namespace marker that
-makes a Roadrunner recognizable in `/dev/serial/by-id`, in host matching, and
-in three documents; changing it changes the USB serial descriptor of every
-board already in the field.
+The amendment takes the first step and gets the larger share of the benefit,
+because the suffix it removes was both the thing setting the width and the
+thing exposing the flash UID.
 
-If the chunk count is genuinely worth optimizing, the better lever is the
-`UNPROVISIONED-` literal, which is what actually sets the width and carries no
-identity at all. `RR-UNPROV-` + 16 hex is 26, making the provisioned form the
-widest at 29 — still 8 chunks, but without touching the namespace prefix.
-Getting to 7 chunks (28 bytes) needs both changes.
+**Dropping `RR-` as well is rejected.** It would save one further chunk out of
+twenty. Against that, `RR-` is the namespace marker that makes a Roadrunner
+recognizable in `/dev/serial/by-id`, in host matching, and in four documents,
+and removing it changes the USB serial descriptor of every board in the field
+for a 5% saving in transactions. The prefix is doing identification work that a
+saved transaction does not pay for.
 
-Since the provisioning work above matches on `RR-UNPROVISIONED-` to detect a
-blank board, that literal is now load-bearing rather than cosmetic, and
-shortening it means changing a string two implementations agree on.
-
-**Recommendation: neither.** Keep `RR-` and keep the register at 34. Nine
-chunks versus eight does not change the pacing design, and the prefix is doing
-identification work that a saved transaction does not pay for.
+The `UNPROVISIONED` literal is likewise not shortened further. The provisioning
+work above matches on it to detect a blank board, so it is load-bearing rather
+than cosmetic, and it now sits comfortably inside the width the provisioned
+serial already requires.
 
 ## Tests
 
