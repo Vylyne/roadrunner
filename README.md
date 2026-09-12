@@ -69,9 +69,10 @@ extra's on-connect path — every route above ultimately goes over USB.
 - [ ] Make a UART-wired board identifiable from the printer object. Klipper's
   ten-byte `tmcuart` buffer caps that transport at four-byte registers, so
   `identity.serial` and `identity.firmware_version` are null there and a host
-  tool cannot tell one UART board from another. Closing it needs either the
-  firmware to serve the identity window in four-byte chunks, or the extra's
-  planned on-connect USB admin path.
+  tool cannot tell one UART board from another. Specced in
+  [docs/roadrunner-uart-chunked-identity-design.md](docs/roadrunner-uart-chunked-identity-design.md)
+  (accepted, unimplemented): serve the identity window in four-byte chunks.
+  The alternative is the extra's planned on-connect USB admin path.
 
 Most 3D printer motion sensors are bulky, slow to trigger, prone to false positives, and have a high detection distance meaning a large amount material is extruded before actually detecting a runout, leading to poor layer adhesion and failed prints after a runout.
 
