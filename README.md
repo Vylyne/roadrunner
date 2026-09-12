@@ -80,7 +80,8 @@ extra's on-connect path — every route above ultimately goes over USB.
   [docs/roadrunner-sensor-bus-provisioning-design.md](docs/roadrunner-sensor-bus-provisioning-design.md)
   (proposed, unimplemented): staged UUID chunks plus a CRC-checked commit,
   accepted only while the board is locked, so a provisioned board refuses every
-  write on the sensor bus.
+  write on the sensor bus. Both designs are sequenced in
+  [docs/roadrunner-identity-implementation-plan.md](docs/roadrunner-identity-implementation-plan.md).
 
 - [ ] Clear `_unhealthy` when the sensor is re-enabled. A disconnect mid-print
   pauses once and latches `_unhealthy` True. `_handle_printing` clears `_runout`
