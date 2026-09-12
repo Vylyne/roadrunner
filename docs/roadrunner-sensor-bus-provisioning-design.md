@@ -128,6 +128,47 @@ CRC rejected — it learns only that the serial did or did not change. That is
 sufficient: the check is end-to-end and does not depend on any transport having
 a reply channel.
 
+### The commit reboots the board, and that is already handled
+
+Nothing in step 3 needs to be built. The extra reads identity lazily from
+`_update_identity` on the sensor poll timer, which only starts at
+`klippy:ready` — not during `klippy:connect`. So the board drops off the bus
+while Klipper is live and idle, and the existing reconnect path absorbs it:
+`_sensor_connected` flips false, then true, and
+[`_sensor_connected_changed`](../klippy/extras/high_resolution_filament_sensor.py#L1128)
+clears `_identity`, `_firmware_image` and `_identity_next_attempt`. Its comment
+already names this exact case — "the board that came back is not necessarily
+the board that went away — it may have been swapped, reflashed or provisioned
+while it was gone."
+
+Two rules follow:
+
+- **Do not block waiting for the board.** Write the chunks, write `COMMIT`,
+  return. The poll timer notices the disconnect, then the reconnect, then
+  re-reads `SERIAL` because the cache was dropped. That re-read *is* the
+  acknowledgement from step 3 — there is no separate wait to implement and no
+  `reactor.pause` inside a handler.
+- **Provision only on the first identity read after `klippy:ready`, never on a
+  later one.** Position is derived from the board's absolute turn and angle
+  counters
+  ([line 1232-1237](../klippy/extras/high_resolution_filament_sensor.py#L1232-L1237)):
+  `distance = new_position - self.position`. A reboot zeros those counters, so
+  `new_position` snaps to zero while `self.position` keeps its old value,
+  producing one spurious reverse `distance` the size of everything measured so
+  far. On the first read `self.position` is still `0.0` and the discontinuity is
+  zero-sized. Any later reboot would inject a false reverse move, which the
+  runout logic would be right to believe.
+
+That second rule is a constraint on this design, not a bug in the extra —
+though it does mean an unrelated mid-print reconnect already carries the same
+discontinuity, since `_sensor_connected_changed` resets the identity cache but
+not `self.position`. Worth a separate look; out of scope here.
+
+The `serial:` transport cannot recover from the reboot at all. `_handle_connect`
+opens the port once and is not re-run, and the `/dev/serial/by-id` path the
+config named stops existing the moment the identity changes. That transport
+raises rather than reconnecting — see below.
+
 ### What "report" means depends on the transport
 
 This is where the cost is smaller than the worst case suggests:
