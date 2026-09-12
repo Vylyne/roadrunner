@@ -20,7 +20,9 @@ These bind every stage. They come from `AGENTS.md` and from the two designs.
   code, and the README in the same change.
 - Bench hardware is a spare RP2040-Zero with a known BOOTSEL recovery path.
   Never a toolhead or an installed sensor. State plainly which stages were
-  exercised on hardware and which were not.
+  exercised on hardware and which were not. The rig is specified in
+  [roadrunner-bench-harness.md](roadrunner-bench-harness.md): a second
+  RP2040-Zero running stock Klipper as bus master.
 - Readable register space ends at `0x7F`: Klipper's `tmc_uart` sets bit 7 of the
   register byte to mean write.
 - Four bytes is a hard per-register ceiling on UART. An over-long read is
