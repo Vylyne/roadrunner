@@ -192,6 +192,84 @@ unprovisioned (a refused commit). A board that silently kept its old identity is
 worse than a startup error, because the next thing that happens is a print
 against a board nobody can name.
 
+## Holding `sensor_connected` false until the identity arrives
+
+The transports diverge on when provisioning can happen, because they diverge on
+when the board is reachable:
+
+- **`serial:`** is opened in `_handle_connect` at `klippy:connect`, so it can
+  provision and raise there. The raise is the whole flow — the port is about to
+  stop existing anyway.
+- **I2C and UART** are not reachable until the parent MCU is up, so the earliest
+  point is the first poll after `klippy:ready`. Nothing is printing yet, and the
+  board reboots under us, so the following poll talks to a freshly provisioned
+  device.
+
+The extra should hold `_sensor_connected` false from the moment it decides to
+provision until it has read back an identity that says provisioned. Identity
+acquisition does not depend on that flag — `_update_identity` runs before the
+`if not self._sensor_connected: return` early-out in `_update_state_from_sensor`
+— so the poll loop keeps retrying the read on its own. `_check_print_issues`
+returns early when not printing, so a false `sensor_connected` in this window
+costs nothing.
+
+### This also fixes a wrong state that exists today
+
+An unprovisioned board is not silent. `prepare_register_data`
+([rp2040/main.c:279-280](../rp2040/main.c#L279-L280)) fills the reply with
+`0xff` when locked, deliberately, so that a refusing board does not read as a
+wiring fault. But `SensorRegister.connected`
+([high_resolution_filament_sensor.py:238-242](../klippy/extras/high_resolution_filament_sensor.py#L238-L242))
+is only `not (... is None ...)` — it asks whether four reads returned bytes, not
+whether those bytes mean anything. The fill decodes to `magnet_state=255`,
+`filament_presence=255`, `full_turns=-1`, `angle=-1`, none of which are `None`.
+
+So the extra currently calls an unprovisioned board **connected**, and feeds
+`full_turns = -1` into the rotation helper, which puts `self.position` at a large
+negative value. When that board is then provisioned and reboots, the counters
+zero and `distance` comes out large and **positive** — which passes the
+`if distance > 0.` gate and toggles the virtual motion callbacks. The refusal
+fill turns the benign case into a false-motion case.
+
+Forcing `sensor_connected` false while the identity says unprovisioned fixes
+this at the same time, and is worth doing whether or not auto-provisioning is
+enabled.
+
+## A boot marker, for reboot detection in general
+
+Distinguishing "the board reset" from "the bus went quiet" is not a
+provisioning-specific need. A brownout or a loose power wire produces the same
+counter discontinuity, and the host has no way to tell the two apart today —
+which is why `_sensor_connected_changed` clears the identity cache but cannot
+safely rebase `self.position`.
+
+A register carrying milliseconds since boot solves it: on every poll, a value
+lower than the previous one means the board restarted. Four bytes, inside the
+UART ceiling.
+
+Prefer this over a sticky "first read since boot" flag that clears on read. The
+UART reader retries up to five times
+([`uart_read_reg`](../klippy/extras/high_resolution_filament_sensor.py#L443-L452)),
+so a clear-on-read flag can be consumed by an attempt whose reply was lost and
+then never observed — the one case where it mattered is the case it misses. A
+monotonic value is idempotent: every read gives the same answer, retries are
+free, and two bus masters do not race.
+
+Two details worth fixing in the definition rather than discovering later:
+
+- **Saturate, do not wrap.** A `uint32_t` of milliseconds wraps at ~49.7 days
+  (the LED burst code already carries a comment about this), and a wrap looks
+  exactly like a reboot. Clamping at the top means "lower than last time" stays
+  an unambiguous reset for the life of the board.
+- **Leave `0xffffffff` alone.** It is the locked-board refusal fill, so cap the
+  saturation at `0xfffffffe` and the sentinel stays distinguishable from a real
+  reading.
+
+What the host does with it is a separate piece of work: rebase `self.position`
+to the new reading without emitting a `distance`, and count the reset in the
+motion statistics as its own category rather than as a read failure. Noted here
+because the provisioning reboot is the first consumer, not the only one.
+
 ## What this retracts
 
 [roadrunner-provisioning-design.md](roadrunner-provisioning-design.md): "All
