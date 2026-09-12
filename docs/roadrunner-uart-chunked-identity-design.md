@@ -72,10 +72,19 @@ sentence, and three disjoint ranges would make it three.
 Every chunk register returns exactly 4 bytes. A chunk index past a field's
 last chunk is not assigned and is refused like any unassigned register.
 
-**No FLASH_UID chunks.** Hosts must not persist the flash UID
-(`roadrunner-usb-admin-protocol.md`), and widening its reach to the one
-transport that most wants a stable identity invites exactly the misuse the
-rule exists to prevent.
+**No FLASH_UID chunks — but not because the UID is withheld.** It is not.
+An unprovisioned board's serial *is* the flash UID: `rr_usb_descriptor_strings_build`
+renders `RR-UNPROVISIONED-` followed by all eight bytes in uppercase hex, so
+the SERIAL chunks carry it in full. `0x30` already does the same over I2C, and
+so does the USB descriptor. That exposure is deliberate — a board you have not
+yet provisioned needs some handle by which to address it.
+
+`0x34` stays off the chunk list for a different reason: presentation. The rule
+that matters is *do not persist the flash UID as an identity*, because
+RP2040 flash-derived serials are not unique. `RR-UNPROVISIONED-` is a loud,
+self-labelling prefix that tells a host exactly what it is holding. A bare
+eight-byte register carries no such label and reads like a field worth
+keeping. Same bytes, opposite invitation.
 
 **Where the window cannot grow.** Klipper's `tmc_uart` sets bit 7 of the
 register byte to mean write, so the readable register space ends at `0x7F`,
@@ -171,6 +180,40 @@ must be revisited** — the fix then is a one-byte generation counter in the
 window, read before and after the sequence, not a re-read of chunk 0 (chunk 0
 of a serial is `RR-U`/`RR-0` and does not discriminate).
 
+## What this unblocks: provisioning from Klipper
+
+The planned next step is for the extra to provision a board that turns up
+unprovisioned. That flow splits across two transports, and this design is the
+missing half of the first one:
+
+- **Detect** over the sensor bus. The extra learns a board is unprovisioned by
+  reading its serial and seeing the `RR-UNPROVISIONED-` prefix. Over I2C that
+  works today. Over UART it does not, because SERIAL is unreadable — so a
+  UART-wired board cannot currently be *detected* as needing provisioning at
+  all. These chunks are what make that detection possible.
+- **Act** over USB CDC. `PROVISION_UUID` is a USB admin opcode, and
+  `roadrunner-provisioning-design.md` is explicit that all maintenance traffic
+  stays on the direct USB port. Nothing about this design changes that.
+
+Three consequences fall out, and belong in that work rather than here:
+
+1. **Detection and action can be on different wires.** A UART-wired board's USB
+   port may not be connected to the host at all. The extra can then detect the
+   condition and not be able to fix it; the right outcome is a message naming
+   the board and asking for the USB connection, not a silent failure.
+2. **The flash UID is the handoff key.** Matching the board found on the sensor
+   bus to the right CDC port is exactly the "transient, confirmed handoff" that
+   `AGENTS.md` permits — and forbids persisting afterwards. Once the board is
+   provisioned its serial changes and the UID must not be kept.
+3. **`PROVISION_UUID` reboots the board.** It must never fire mid-print. Gate it
+   to idle.
+
+There is a gap here today that predates this design: the extra reports whatever
+serial it reads straight into `get_status()`, with no `UNPROVISIONED` handling,
+and Moonraker persists printer objects. A transient diagnostic handle is
+therefore already being written somewhere durable. Worth closing as part of the
+provisioning work.
+
 ## Serial length — is a shorter serial worth it?
 
 Asked directly: dropping the `RR-` prefix saves one chunk out of nine. The
@@ -196,6 +239,10 @@ If the chunk count is genuinely worth optimizing, the better lever is the
 identity at all. `RR-UNPROV-` + 16 hex is 26, making the provisioned form the
 widest at 29 — still 8 chunks, but without touching the namespace prefix.
 Getting to 7 chunks (28 bytes) needs both changes.
+
+Since the provisioning work above matches on `RR-UNPROVISIONED-` to detect a
+blank board, that literal is now load-bearing rather than cosmetic, and
+shortening it means changing a string two implementations agree on.
 
 **Recommendation: neither.** Keep `RR-` and keep the register at 34. Nine
 chunks versus eight does not change the pacing design, and the prefix is doing
