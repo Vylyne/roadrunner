@@ -270,6 +270,48 @@ to the new reading without emitting a `distance`, and count the reset in the
 motion statistics as its own category rather than as a read failure. Noted here
 because the provisioning reboot is the first consumer, not the only one.
 
+## The `serial:` transport needs no write form
+
+The `0xf5 <reg>` framing is a two-byte state machine
+([rp2040/usbserial.c:61-69](../rp2040/usbserial.c#L61-L69)): `0xf5`, then any
+byte is a register number to answer. There is no write form and none needs
+adding, because the board has exactly one CDC interface (`CFG_TUD_CDC 1`) and
+the USB admin protocol is already on it.
+
+`rr_usb_admin_poll` drains the port and `rr_usb_admin_receive`
+([rp2040/usb_admin.c:347-359](../rp2040/usb_admin.c#L347-L359)) is the
+demultiplexer: `0x52 0x52` opens an admin frame, and every other byte is handed
+to `usbserial_receive_byte` as a legacy byte. The two protocols already share
+the port, with the admin parser as the front door.
+
+So the `serial:` transport provisions by writing
+`0x52 0x52 0x01 PROVISION_UUID …` down the same `serial.Serial` handle it
+already uses for reads. No new framing, no staging registers, no commit
+register — the existing USB admin protocol carries the length and CRC itself.
+The staging registers at `0x50`–`0x54` exist for I2C and UART only.
+
+### Constraint this creates: no register may be numbered `0x52`
+
+Over `serial:`, a read of register `0x52` sends `0xf5 0x52`. The admin parser
+sees `0xf5`, forwards it (usbserial sets `waiting_for_register`), then sees
+`0x52`, recognises it as `RR_USB_ADMIN_SYNC` and opens an admin frame instead of
+forwarding it. The register is never read and both state machines are left
+mid-sequence.
+
+No current or planned register hits this — the sensor registers are
+`0x20`–`0x24`, identity is `0x30`–`0x49`, staging is `0x50`–`0x54` and is not
+used on this transport. It is written down because the next person to allocate a
+register number has no other way to know.
+
+## Register numbers
+
+- Staging chunks `0x50`–`0x53`, commit `0x54`. I2C and UART only.
+- Boot marker `0x25`, four bytes: milliseconds since boot, saturating at
+  `0xfffffffe` so the value never wraps into looking like a reset and never
+  collides with the `0xffffffff` locked-board refusal fill. Placed next to the
+  sensor registers rather than in the identity window: it is read on every poll,
+  and the identity window is for things read once.
+
 ## What this retracts
 
 [roadrunner-provisioning-design.md](roadrunner-provisioning-design.md): "All
@@ -293,11 +335,8 @@ is not exposed to it.
   `RegisterReaderGeneric` and its three subclasses are read-only today; each
   needs a write counterpart, and `RegisterReaderUART` needs one that does not
   pretend to have a return value.
-- Whether the sensor serial framing (`0xf5 <reg>` request, `0x05 0xff <reg>`
-  reply) has any write form at all. If it does not, the `serial:` transport
-  provisions over the USB admin port as it does today and this design covers I2C
-  and UART only — which loses nothing, since that is the variant with a working
-  USB path.
+- ~~Whether the sensor serial framing has a write form.~~ Resolved, see "The
+  `serial:` transport needs no write form" below.
 - UUID generation is host-side here, chosen so the host knows the serial to
   print in the error message before the board reboots. The alternative — firmware
   generates, host reads back — removes the staging buffer entirely but gives the
