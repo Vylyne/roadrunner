@@ -169,8 +169,10 @@ Pi 3:
   udev automount took more than the old 10 s mount wait, so the tool gave up
   with the board in BOOTSEL. The UF2 was then copied by hand. The copy, sync
   and apply took 12 s, and the board was back on USB as soon as the volume
-  went. The mount wait is now 30 s. The apply-then-reboot wait from
-  `c0cab17` has still not run on hardware.
+  went. The mount wait is now 30 s. With that change (`aadee45`), a second
+  `flash` of the same image ran the whole flow in about 11 s and exited
+  cleanly: reboot to BOOTSEL, mount, copy, wait for the apply, re-enumerate,
+  INFO.
 - After a Klipper service restart, `identity.serial` was
   `RR-7HZHY879879X19ZQZTJYQ7DDRB` and `firmware_version` was `7d22724`.
   `firmware_image` reported digest `0x5d54b009` with start `0x10000000` and
