@@ -90,7 +90,9 @@ fit — and removes the UID from the sensor bus entirely.
 - `tests/test_high_resolution_filament_sensor.py` — the SERIAL width follows
   `IdentityRegister.SIZES`.
 - Bench: flash an unprovisioned board and confirm `lsusb -v` and
-  `/dev/serial/by-id` show the bare serial.
+  `/dev/serial/by-id` show the bare serial. *Not yet run (2026-09-13):* the
+  only bench DUT is provisioned, and clearing it to test this would destroy
+  its identity. It needs a spare blank board, or a decision to clear the DUT.
 
 ## Stage 2 — chunked identity reads
 

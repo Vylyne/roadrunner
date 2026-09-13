@@ -439,6 +439,10 @@ static void test_usb_admin_info_frame_unprovisioned_serial(void) {
         rr_usb_admin_receive(request[index]);
     }
 
+    /* The provisioned golden frame's 74-byte payload, less the 13 serial
+     * characters this one lacks. Pins the layout the offsets rely on. */
+    assert(io.response_length == 5u + 61u + 1u);
+    assert(io.response[4] == 61u);
     assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
     assert(io.response[9] == 13u);
     assert(io.response[23] == 3u);
