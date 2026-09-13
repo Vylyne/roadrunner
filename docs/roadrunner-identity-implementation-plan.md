@@ -161,6 +161,13 @@ is first read, instead of on every attempt at the image registers. The
 unprovisioned serial takes five chunks, not the four the read design first
 said, because its NUL is chunk 4.
 
+A UART identity read is 12 to 18 register transactions, where I2C needs 4, so
+a marginal bus has more chances to lose one. Two outcomes are by design. A
+chunk that exhausts its retries leaves that field `None` until the sensor
+reconnects, because a cached identity is not read again. A STATE read that
+fails partway through discards the chunks gathered so far, and the whole read
+starts again after the 10 s retry timer.
+
 *Bench, passed 2026-09-13*, on the full Roadrunner DUT running
 `roadrunner_v1_uart_rgb` from `e9587a0`, over Klipper tmcuart on a Raspberry
 Pi 3:
@@ -174,7 +181,9 @@ Pi 3:
   cleanly: reboot to BOOTSEL, mount, copy, wait for the apply, re-enumerate,
   INFO.
 - After a Klipper service restart, `identity.serial` was
-  `RR-7HZHY879879X19ZQZTJYQ7DDRB` and `firmware_version` was `7d22724`.
+  `RR-7HZHY879879X19ZQZTJYQ7DDRB` and `firmware_version` was `7d22724`. That
+  string is stale: it is set when CMake configures the build directory, which
+  had not been reconfigured since `7d22724`.
   `firmware_image` reported digest `0x5d54b009` with start `0x10000000` and
   length 30996. The ELF's `__flash_binary_end` is `0x10007914`, which is
   30996 bytes, and `uf2_image_digest.py` over the UF2 gives `0x5d54b009`.
