@@ -90,9 +90,13 @@ fit — and removes the UID from the sensor bus entirely.
 - `tests/test_high_resolution_filament_sensor.py` — the SERIAL width follows
   `IdentityRegister.SIZES`.
 - Bench: flash an unprovisioned board and confirm `lsusb -v` and
-  `/dev/serial/by-id` show the bare serial. *Not yet run (2026-09-13):* the
-  only bench DUT is provisioned, and clearing it to test this would destroy
-  its identity. It needs a spare blank board, or a decision to clear the DUT.
+  `/dev/serial/by-id` show the bare serial. *Passed 2026-09-13* on the bench
+  DUT with `roadrunner_v1_uart_rgb` from this branch. The board reported image
+  digest `0x3da2b6ee`, matching the UF2 over 30892 bytes. After `clear`,
+  `iSerial`, `ID_SERIAL_SHORT`, the by-id link and INFO all read exactly
+  `RR-UNPROVISIONED`, and Klipper reported `identity.state: none` with sensor
+  data withheld. After `provision` the board came back as
+  `RR-7HZHY879879X19ZQZTJYQ7DDRB` and Klipper read the magnet again.
 
 ## Stage 2 — chunked identity reads
 
