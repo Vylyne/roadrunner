@@ -161,6 +161,28 @@ is first read, instead of on every attempt at the image registers. The
 unprovisioned serial takes five chunks, not the four the read design first
 said, because its NUL is chunk 4.
 
+*Bench, passed 2026-09-13*, on the full Roadrunner DUT running
+`roadrunner_v1_uart_rgb` from `e9587a0`, over Klipper tmcuart on a Raspberry
+Pi 3:
+
+- Flashed with `roadrunner_admin.py flash`. The copy step did not run: the
+  udev automount took more than the old 10 s mount wait, so the tool gave up
+  with the board in BOOTSEL. The UF2 was then copied by hand. The copy, sync
+  and apply took 12 s, and the board was back on USB as soon as the volume
+  went. The mount wait is now 30 s. The apply-then-reboot wait from
+  `c0cab17` has still not run on hardware.
+- After a Klipper service restart, `identity.serial` was
+  `RR-7HZHY879879X19ZQZTJYQ7DDRB` and `firmware_version` was `7d22724`.
+  `firmware_image` reported digest `0x5d54b009` with start `0x10000000` and
+  length 30996. The ELF's `__flash_binary_end` is `0x10007914`, which is
+  30996 bytes, and `uf2_image_digest.py` over the UF2 gives `0x5d54b009`.
+- Klipper's `RESTART` does not reload the extra's Python; the first check
+  after one still showed `null` fields. It takes a service restart.
+- First-read cost, from a timing patch that was reverted afterwards: the
+  identity finished on the second poll. The two attempts took 52 ms and 47 ms,
+  on top of the 19 ms sensor read, so both polls stayed inside the 100 ms poll
+  interval. `reads_failed` stayed 0 and no chunk failures were logged.
+
 ## Stage 3 — boot marker at `0x25`
 
 Lets the host tell "the board reset" from "the bus went quiet". Standalone: it

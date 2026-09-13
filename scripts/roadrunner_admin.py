@@ -654,8 +654,11 @@ def require_writable(volume: Path) -> Path:
     return volume
 
 
-def wait_for_bootsel_mount(prefix: str | None = None, timeout: float = 10) -> Path:
-    """Wait for the boot ROM volume, following `prefix` when we have one."""
+def wait_for_bootsel_mount(prefix: str | None = None, timeout: float = 30) -> Path:
+    """Wait for the boot ROM volume, following `prefix` when we have one.
+
+    30s, not 10: on a Raspberry Pi 3 the udev automount took more than 10s to
+    mount a volume whose block device was already there."""
     saw_device = False
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
