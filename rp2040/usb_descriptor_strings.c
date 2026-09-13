@@ -5,9 +5,8 @@
 void rr_usb_descriptor_strings_build(
     struct rr_usb_descriptor_strings *strings,
     rr_identity_status_t identity_status,
-    const struct rr_identity *identity,
-    const uint8_t flash_uid[RR_USB_FLASH_UID_SIZE]) {
-    static const char hex[] = "0123456789ABCDEF";
+    const struct rr_identity *identity) {
+    static const char unprovisioned[] = "RR-UNPROVISIONED";
 
     if (strings == NULL) {
         return;
@@ -17,10 +16,8 @@ void rr_usb_descriptor_strings_build(
         return;
     }
 
-    memcpy(strings->serial, "RR-UNPROVISIONED-", 17u);
-    for (unsigned int index = 0; index < RR_USB_FLASH_UID_SIZE; ++index) {
-        strings->serial[17u + index * 2u] = hex[flash_uid[index] >> 4u];
-        strings->serial[18u + index * 2u] = hex[flash_uid[index] & 0x0fu];
-    }
-    strings->serial[17u + RR_USB_FLASH_UID_SIZE * 2u] = '\0';
+    /* No flash UID suffix: boards from one batch share a UID, so a suffix
+     * disguised the collision rather than preventing it. See the amendment in
+     * docs/roadrunner-uart-chunked-identity-design.md. */
+    memcpy(strings->serial, unprovisioned, sizeof(unprovisioned));
 }

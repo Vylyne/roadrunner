@@ -100,7 +100,7 @@ class IdentityRegister:
     # table in docs/roadrunner-usb-admin-protocol.md.
     SIZES : dict[int, int] = {
         STATE: 1,
-        SERIAL: 34,
+        SERIAL: 32,
         FIRMWARE_VERSION: 32,
         VARIANT: 2,
         IMAGE_DIGEST: 4,
@@ -402,7 +402,7 @@ class RegisterReaderUART(RegisterReaderGeneric):
     # bytes, which reaches exactly 10 at a 4-byte register, so four bytes is a
     # hard ceiling on this transport.
     #
-    # That leaves STATE (1) and VARIANT (2) readable. SERIAL (34) and
+    # That leaves STATE (1) and VARIANT (2) readable. SERIAL (32) and
     # FIRMWARE_VERSION (32) are not, and are reported as None rather than
     # attempted: reading them here would require the firmware to offer the
     # window in four-byte chunks, which it does not.
@@ -1159,7 +1159,7 @@ class HighResolutionFilamentSensor:
         """ Read the board's identity, once, and cache it.
 
         Identity does not change between reboots, so this has no business in
-        the 100ms sensor poll: over I2C the serial register alone is 34
+        the 100ms sensor poll: over I2C the serial register alone is 32
         RD_REQ events with the bus clock-stretching, and over UART it is
         bit-banged. Read it when the board first answers, keep it, and retry
         on a slow timer for as long as the read fails.

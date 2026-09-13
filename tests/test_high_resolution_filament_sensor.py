@@ -203,7 +203,8 @@ def test_uart_never_asks_for_a_register_that_would_shut_down_the_mcu(monkeypatch
     reader = module.RegisterReaderUART(uart)
 
     with caplog.at_level(logging.WARNING):
-        assert reader.read_reg(module.IdentityRegister.SERIAL, 34) is None
+        reg = module.IdentityRegister
+        assert reader.read_reg(reg.SERIAL, reg.SIZES[reg.SERIAL]) is None
 
     assert uart.reads == []
     assert any("tmcuart buffer" in message for message in caplog.messages)
@@ -281,7 +282,7 @@ def _bare_sensor(module, reader):
 
 
 def test_identity_is_read_once_not_on_every_sensor_poll(monkeypatch):
-    """34 bytes over a clock-stretching I2C bus has no place in a 100ms loop."""
+    """32 bytes over a clock-stretching I2C bus has no place in a 100ms loop."""
     module = _load_extra(monkeypatch)
 
     reader = _generic_reader(module, _identity_payloads(module))
@@ -495,7 +496,7 @@ def test_uart_reads_the_digest_but_never_the_range(monkeypatch):
 
 
 def test_a_failed_digest_read_retries_without_re_reading_the_identity(monkeypatch):
-    """Identity is 34 bytes over a slow bus; do not pay for it twice."""
+    """Identity is 32 bytes over a slow bus; do not pay for it twice."""
     module = _load_extra(monkeypatch)
 
     payloads = _identity_payloads(module)

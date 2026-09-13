@@ -50,21 +50,45 @@ fit — and removes the UID from the sensor bus entirely.
 - `rp2040/usb_descriptor_strings.c` — `rr_usb_descriptor_strings_build` stops
   appending the hex UID. The serial becomes the bare `RR-UNPROVISIONED`,
   NUL-terminated.
-- `rp2040/usb_descriptor_strings.h` — `RR_USB_SERIAL_MAX_LENGTH` 34 → 32.
+- `rp2040/usb_descriptor_strings.h` — `RR_USB_SERIAL_MAX_LENGTH` 34 → 32. The
+  build function loses its `flash_uid` parameter.
+- `rp2040/usb_descriptors.c` — drops `pico_get_unique_board_id()`, which only
+  fed the suffix.
+- `rp2040/identity_registers.c`, `identity_registers.h` — the `0x31` caller and
+  its width comment. `0x34` still reports the flash UID.
+- `rp2040/usb_admin.c` — INFO builds the serial separately and needs the same
+  change; its buffer shrinks to `RR_IDENTITY_SERIAL_LENGTH + 1`. INFO's own
+  flash UID field is unchanged.
+
+**Klippy and scripts**
+
+- `klippy/extras/high_resolution_filament_sensor.py` — `IdentityRegister.SIZES`
+  `SERIAL` 34 → 32, and the comments that quote it.
+- `scripts/roadrunner_admin.py`, `scripts/oneoff_flash_and_test.py` — the
+  `0x31` read width and `UNPROVISIONED_RE`. The scripts still accept the old
+  suffixed form, because they read boards before reflashing them.
+- `README.md` documents no `0x31` width and no unprovisioned serial, so it does
+  not change.
 
 **Docs**
 
 - `roadrunner-provisioning-design.md` — the "Identity presentation" section.
 - `roadrunner-usb-admin-protocol.md` — the INFO serial text and every `34`
-  width.
+  width. The INFO serial field drops to 1 + up to 29 and the maximum payload to
+  103 bytes.
 - `roadrunner-identity-gate-design.md` — the hazard 1 note and the `0x31` row
   lengths.
+- `roadrunner-uart-chunked-identity-design.md` — the one current-tense mention
+  of the prefix. The amendment's historical text stays.
 
 **Verification**
 
 - `rp2040/tests/test_identity_record.c` and `test_identity_registers.c` cover
   the serial construction; update expectations and add a case asserting the
-  unprovisioned serial is exactly `RR-UNPROVISIONED` with no suffix.
+  unprovisioned serial is exactly `RR-UNPROVISIONED` with no suffix. INFO needs
+  its own case, since it builds the serial separately.
+- `tests/test_high_resolution_filament_sensor.py` — the SERIAL width follows
+  `IdentityRegister.SIZES`.
 - Bench: flash an unprovisioned board and confirm `lsusb -v` and
   `/dev/serial/by-id` show the bare serial.
 

@@ -1,7 +1,6 @@
 #include "identity_store.h"
 #include "usb_descriptor_strings.h"
 
-#include "pico/unique_id.h"
 #include "tusb.h"
 
 enum {
@@ -42,12 +41,9 @@ static struct rr_usb_descriptor_strings rr_usb_strings;
 
 void rr_usb_descriptors_init(const struct rr_identity_store *store) {
     struct rr_identity identity;
-    pico_unique_board_id_t board_id;
     rr_identity_status_t status = rr_identity_load(store, &identity);
 
-    pico_get_unique_board_id(&board_id);
-    rr_usb_descriptor_strings_build(&rr_usb_strings, status, &identity,
-                                    board_id.id);
+    rr_usb_descriptor_strings_build(&rr_usb_strings, status, &identity);
     tusb_init();
 }
 

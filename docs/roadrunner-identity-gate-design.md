@@ -19,6 +19,10 @@ touches a Roadrunner, and it has already produced four separate hazards:
    name, so with two unprovisioned boards attached it sees **one**, and the
    "refuse ambiguous matches" guard never fires because no ambiguity is visible.
    Confirmed on hardware: provisioning the visible board made the second appear.
+   *Since amended:* the UID suffix is gone and every unprovisioned board reports
+   exactly `RR-UNPROVISIONED`. The collision is now universal rather than
+   batch-dependent, and no longer disguised as uniqueness — see the amendment in
+   `roadrunner-uart-chunked-identity-design.md`.
 
 2. **Port freedom is not safety.** mcu-updater gates Roadrunner discovery on
    `needs_ports_free = True`. For the USB-serial variant that coincides with
@@ -62,7 +66,7 @@ revisit it.
   narrows to what it should always have been: a guard on `CLEAR_IDENTITY` and
   `REBOOT_BOOTSEL` against *provisioned* boards.
 - **Hazard 3 disappears at the source.** Nobody can have a working `printer.cfg`
-  that references `RR-UNPROVISIONED-…`, because that board never worked.
+  that references `RR-UNPROVISIONED`, because that board never worked.
   Provision-before-configure stops being advice and becomes the only path.
 - **Hazard 1 stops mattering for safety.** Colliding unprovisioned serials are
   still a discovery nuisance (see "Still required" below) but no longer a
@@ -145,7 +149,7 @@ A new register range, chosen to clear the existing sensor map (`0x10`,
 | Register | Name | Size | Content |
 | ---: | --- | ---: | --- |
 | `0x30` | `READ_IDENTITY_STATE` | 1 | `rr_identity_status_t` — 0 none, 1 ok, 2 conflict, 3 already provisioned, 4 I/O error |
-| `0x31` | `READ_SERIAL` | 34 | ASCII, NUL-padded. `RR_USB_SERIAL_MAX_LENGTH` is 34; the longest real serial, `RR-UNPROVISIONED-<16 hex>`, is 33 |
+| `0x31` | `READ_SERIAL` | 32 | ASCII, NUL-padded. `RR_USB_SERIAL_MAX_LENGTH` is 32; the longest real serial, a provisioned `RR-<26 base32>`, is 29 |
 | `0x32` | `READ_FIRMWARE_VERSION` | 32 | ASCII, NUL-padded |
 | `0x33` | `READ_VARIANT` | 2 | transport byte, LED-order byte — same values as the USB `INFO` payload |
 | `0x34` | `READ_FLASH_UID` | 8 | Raw diagnostic bytes. **Hosts must not persist this** |

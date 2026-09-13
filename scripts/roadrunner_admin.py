@@ -70,9 +70,11 @@ LED_ORDER_NAMES = {1: "RGB", 2: "GRB"}
 USB_MANUFACTURER = "Vylyne"
 USB_PRODUCT = "Roadrunner"
 
-# An unprovisioned serial is RR-UNPROVISIONED- plus the 16-hex flash UID; a
-# provisioned one is RR- plus 26 Crockford base32 characters.
-UNPROVISIONED_RE = re.compile(r"^RR-UNPROVISIONED-[0-9A-F]{16}$")
+# An unprovisioned serial is exactly RR-UNPROVISIONED; a provisioned one is RR-
+# plus 26 Crockford base32 characters. The -<16 hex flash UID> suffix is older
+# firmware, still accepted because this tool meets boards before they are
+# reflashed.
+UNPROVISIONED_RE = re.compile(r"^RR-UNPROVISIONED(-[0-9A-F]{16})?$")
 
 # Placeholder serial for an explicit --port that USB discovery cannot see.
 # Destructive commands resolve it against the board before proceeding.
@@ -90,7 +92,7 @@ REGISTERS = {
     0x23: ("READ_FULL_TURNS", 4),
     0x24: ("READ_ANGLE", 4),
     0x30: ("READ_IDENTITY_STATE", 1),
-    0x31: ("READ_SERIAL", 34),
+    0x31: ("READ_SERIAL", 32),
     0x32: ("READ_FIRMWARE_VERSION", 32),
     0x33: ("READ_VARIANT", 2),
     0x34: ("READ_FLASH_UID", 8),

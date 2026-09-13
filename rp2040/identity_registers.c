@@ -61,8 +61,7 @@ bool rr_identity_registers_read(uint8_t reg, uint8_t *buf, size_t *length)
          * off the USB descriptor - there is only one serial. */
         rr_usb_descriptor_strings_build(
             &strings, rr_identity_registers_config.identity_status,
-            rr_identity_registers_config.identity,
-            rr_identity_registers_config.flash_uid);
+            rr_identity_registers_config.identity);
         rr_identity_registers_copy_string(buf, RR_REG_SERIAL_SIZE,
                                           strings.serial);
         *length = RR_REG_SERIAL_SIZE;

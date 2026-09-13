@@ -14,9 +14,11 @@ It is stored only in the two existing validated identity records.
 
 `RR-` is a non-versioned display namespace. Firmware renders a provisioned
 UUID as `RR-` followed by 26 uppercase Crockford-base32 characters. A blank
-board renders `RR-UNPROVISIONED-` followed by its eight-byte flash UID in
-uppercase hexadecimal. The flash UID is diagnostic only: it is never stored
-by mcu-updater as the board identity and never used to select a write.
+board renders exactly `RR-UNPROVISIONED`, with no flash UID suffix — boards
+from one batch share a UID, so the suffix only disguised the collision. The
+flash UID is diagnostic only, readable in INFO and at register `0x34`: it is
+never stored by mcu-updater as the board identity and never used to select a
+write.
 
 These values are deliberately distinct:
 
@@ -25,7 +27,8 @@ These values are deliberately distinct:
 - `roadrunner-v1` identifies the hardware design in INFO; and
 - `RR-` namespaces a human-readable serial and contains no version.
 
-USB descriptors and INFO use the same serial formatter.
+USB descriptors and INFO render the same serial. They build it in two places,
+`usb_descriptor_strings.c` and `usb_admin.c`, and host tests pin both.
 
 ## Direct-USB protocol additions
 

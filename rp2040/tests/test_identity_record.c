@@ -405,6 +405,50 @@ static void test_usb_admin_info_frame(void) {
     assert(memcmp(io.response, expected_response, sizeof(expected_response)) == 0);
 }
 
+/* INFO builds its serial separately from the USB descriptor, so it needs its
+ * own check that an unprovisioned serial is the bare word. The flash UID still
+ * travels in its own field straight after it. */
+static void test_usb_admin_info_frame_unprovisioned_serial(void) {
+    static const uint8_t request[] = {0x52, 0x52, 0x01, 0x01, 0x00, 0x90};
+    static const char serial[] = "RR-UNPROVISIONED";
+    static const uint8_t flash_uid[RR_USB_ADMIN_FLASH_UID_SIZE] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    };
+    /* Five header bytes, status, store state, transport, LED order, model
+     * (1 + 13) and version (1 + 3) put the serial length byte at 27. */
+    const size_t serial_offset = 27u;
+    struct usb_admin_test_io io = {0};
+    struct rr_usb_admin_config config = {
+        .identity_status = RR_IDENTITY_NONE,
+        .identity = NULL,
+        .flash_uid = flash_uid,
+        .transport = RR_USB_ADMIN_TRANSPORT_USB,
+        .led_order = RR_USB_ADMIN_LED_GRB,
+        .firmware_version = "dev",
+        .context = &io,
+        .write = usb_admin_test_write,
+        .legacy_byte = usb_admin_test_legacy_byte,
+        .flush = usb_admin_test_flush,
+        .transmit_complete = usb_admin_test_transmit_complete,
+        .reboot_bootsel = usb_admin_test_reboot_bootsel,
+    };
+
+    install_golden_image();
+    rr_usb_admin_init(&config);
+    for (size_t index = 0; index < sizeof(request); ++index) {
+        rr_usb_admin_receive(request[index]);
+    }
+
+    assert(io.response[5] == RR_USB_ADMIN_UNPROVISIONED);
+    assert(io.response[9] == 13u);
+    assert(io.response[23] == 3u);
+    assert(io.response[serial_offset] == sizeof(serial) - 1u);
+    assert(memcmp(io.response + serial_offset + 1u, serial,
+                  sizeof(serial) - 1u) == 0);
+    assert(memcmp(io.response + serial_offset + sizeof(serial), flash_uid,
+                  sizeof(flash_uid)) == 0);
+}
+
 /* A board that cannot compute a digest must say so with the algorithm byte.
  * Reporting 0x00000000 instead would be a legal CRC value, and a host would
  * compare it against a real one and conclude the board is running the wrong
@@ -654,9 +698,6 @@ int main(void) {
     struct rr_identity_store conflict_store;
     struct rr_identity descriptor_identity = {0};
     struct rr_usb_descriptor_strings descriptor_strings;
-    uint8_t flash_uid[RR_USB_FLASH_UID_SIZE] = {
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-    };
 
     assert(ROADRUNNER_IDENTITY_FLASH_OFFSET == 0x1FF000u);
     assert(ROADRUNNER_IDENTITY_SECTOR_SIZE == 0x1000u);
@@ -745,17 +786,17 @@ int main(void) {
 
     descriptor_identity.uuid[0] = 0;
     rr_usb_descriptor_strings_build(&descriptor_strings, RR_IDENTITY_OK,
-                                    &descriptor_identity, flash_uid);
+                                    &descriptor_identity);
     assert(strcmp(RR_USB_MANUFACTURER, "Vylyne") == 0);
     assert(strcmp(RR_USB_PRODUCT, "Roadrunner") == 0);
     assert(strcmp(descriptor_strings.serial,
                   "RR-00000000000000000000000000") == 0);
 
     rr_usb_descriptor_strings_build(&descriptor_strings, RR_IDENTITY_NONE,
-                                    NULL, flash_uid);
-    assert(strcmp(descriptor_strings.serial,
-                  "RR-UNPROVISIONED-0123456789ABCDEF") == 0);
+                                    NULL);
+    assert(strcmp(descriptor_strings.serial, "RR-UNPROVISIONED") == 0);
     test_usb_admin_info_frame();
+    test_usb_admin_info_frame_unprovisioned_serial();
     test_usb_admin_info_frame_without_a_digest();
     test_usb_admin_preserves_legacy_register_traffic();
     test_usb_admin_rejects_bad_crc();

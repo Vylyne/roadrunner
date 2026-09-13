@@ -29,8 +29,8 @@ enum {
     RR_REG_IMAGE_RANGE = 0x36,
 };
 
-/* RR_USB_SERIAL_MAX_LENGTH is 34; the longest real serial,
- * RR-UNPROVISIONED-<16 hex>, is 33. NUL-padded to the full width so a host
+/* RR_USB_SERIAL_MAX_LENGTH is 32; the longest real serial, a provisioned
+ * RR-<26 base32>, is 29. NUL-padded to the full width so a host
  * reads a fixed-size register rather than having to frame a variable one. */
 #define RR_REG_SERIAL_SIZE RR_USB_SERIAL_MAX_LENGTH
 #define RR_REG_FIRMWARE_VERSION_SIZE 32u

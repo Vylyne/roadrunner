@@ -186,7 +186,7 @@ unprovisioned. That flow splits across two transports, and this design is the
 missing half of the first one:
 
 - **Detect** over the sensor bus. The extra learns a board is unprovisioned by
-  reading its serial and seeing the `RR-UNPROVISIONED-` prefix. Over I2C that
+  reading its serial and seeing `RR-UNPROVISIONED`. Over I2C that
   works today. Over UART it does not, because SERIAL is unreadable — so a
   UART-wired board cannot currently be *detected* as needing provisioning at
   all. These chunks are what make that detection possible.

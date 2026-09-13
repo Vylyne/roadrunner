@@ -190,8 +190,11 @@ static void rr_usb_admin_acknowledge_before_application_reboot(
     rr_usb_admin_reboot_application();
 }
 
-static void rr_usb_admin_make_serial(char serial[35]) {
-    static const char hexadecimal[] = "0123456789ABCDEF";
+/* Must match rr_usb_descriptor_strings_build: the INFO serial and the USB
+ * descriptor serial are the same serial. The flash UID is not part of it - it
+ * has its own INFO field. */
+static void rr_usb_admin_make_serial(char serial[RR_IDENTITY_SERIAL_LENGTH + 1u]) {
+    static const char unprovisioned[] = "RR-UNPROVISIONED";
 
     if (rr_usb_admin_config.identity_status == RR_IDENTITY_OK
         && rr_usb_admin_config.identity != NULL) {
@@ -199,14 +202,7 @@ static void rr_usb_admin_make_serial(char serial[35]) {
         return;
     }
 
-    memcpy(serial, "RR-UNPROVISIONED-", 17u);
-    for (size_t index = 0; index < RR_USB_ADMIN_FLASH_UID_SIZE; ++index) {
-        uint8_t byte = rr_usb_admin_config.flash_uid == NULL ? 0u
-            : rr_usb_admin_config.flash_uid[index];
-        serial[17u + index * 2u] = hexadecimal[byte >> 4u];
-        serial[18u + index * 2u] = hexadecimal[byte & 0x0fu];
-    }
-    serial[17u + RR_USB_ADMIN_FLASH_UID_SIZE * 2u] = '\0';
+    memcpy(serial, unprovisioned, sizeof(unprovisioned));
 }
 
 /* Little-endian, matching the two 32-bit INFO fields and registers 0x35
@@ -223,7 +219,7 @@ static void rr_usb_admin_put_u32(uint8_t *buf, uint32_t value) {
 static void rr_usb_admin_send_info(void) {
     uint8_t payload[RR_USB_ADMIN_MAX_RESPONSE_PAYLOAD];
     const struct rr_image_digest *image;
-    char serial[35];
+    char serial[RR_IDENTITY_SERIAL_LENGTH + 1u];
     size_t version_length = rr_usb_admin_string_length(
         rr_usb_admin_config.firmware_version, RR_USB_ADMIN_MAX_VERSION_LENGTH);
     size_t serial_length;

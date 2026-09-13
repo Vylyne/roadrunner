@@ -49,7 +49,7 @@ static void test_reports_provisioned_serial(void) {
 
     configure(RR_IDENTITY_OK);
     rr_usb_descriptor_strings_build(&expected, RR_IDENTITY_OK,
-                                    &test_identity, test_flash_uid);
+                                    &test_identity);
 
     assert(rr_identity_registers_read(RR_REG_SERIAL, buf, &length));
     assert(length == RR_REG_SERIAL_SIZE);
@@ -63,8 +63,9 @@ static void test_reports_unprovisioned_serial(void) {
     configure(RR_IDENTITY_NONE);
     assert(rr_identity_registers_read(RR_REG_SERIAL, buf, &length));
     assert(length == RR_REG_SERIAL_SIZE);
-    assert(strcmp((const char *)buf,
-                  "RR-UNPROVISIONED-0123456789ABCDEF") == 0);
+    /* Exactly the bare word: no flash UID suffix, even though the config
+     * carries a flash UID. */
+    assert(strcmp((const char *)buf, "RR-UNPROVISIONED") == 0);
 }
 
 static void test_pads_serial_with_nuls(void) {

@@ -39,9 +39,11 @@ USB_MANUFACTURER = "Vylyne"
 USB_PRODUCT = "Roadrunner"
 
 # A provisioned serial is RR- plus 26 Crockford base32 characters (no I/L/O/U);
-# an unprovisioned one is RR-UNPROVISIONED- plus the 16-hex flash UID.
+# an unprovisioned one is exactly RR-UNPROVISIONED. The -<16 hex flash UID>
+# suffix is older firmware, still accepted because this script meets boards
+# before they are reflashed.
 PROVISIONED_RE = re.compile(r"^RR-[0-9A-HJKMNP-TV-Z]{26}$")
-UNPROVISIONED_RE = re.compile(r"^RR-UNPROVISIONED-[0-9A-F]{16}$")
+UNPROVISIONED_RE = re.compile(r"^RR-UNPROVISIONED(-[0-9A-F]{16})?$")
 
 # The RP2040 boot ROM's volume label, and the file every UF2 bootloader
 # publishes at its root. The marker is what actually identifies the drive - an
@@ -213,7 +215,7 @@ def test_usbserial_locked(port: str) -> None:
             f"should have no identity (expected 0x00 / RR_IDENTITY_NONE)"
         )
 
-    serial_bytes = read_register(port, 0x31, 34)
+    serial_bytes = read_register(port, 0x31, 32)
     reported = serial_bytes.split(b"\x00", 1)[0].decode("ascii", "replace")
     print("locked serial:    ", reported)
     if not UNPROVISIONED_RE.match(reported):
