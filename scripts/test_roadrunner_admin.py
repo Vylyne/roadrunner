@@ -99,6 +99,122 @@ def test_wait_for_serial_port_ignores_the_outgoing_enumeration(monkeypatch):
     assert seen, "the wait never polled"
 
 
+def test_copy_uf2_writes_the_image(tmp_path):
+    uf2 = tmp_path / "image.uf2"
+    uf2.write_bytes(b"\x55\x46\x32\x0a" * 128)
+    volume = tmp_path / "RPI-RP2"
+    volume.mkdir()
+
+    assert admin.copy_uf2(uf2, volume) is None
+    assert (volume / "image.uf2").read_bytes() == uf2.read_bytes()
+
+
+def test_copy_uf2_returns_the_error_instead_of_raising(tmp_path):
+    """The ROM can reboot mid-close, so a failed copy is not yet a failure."""
+    uf2 = tmp_path / "image.uf2"
+    uf2.write_bytes(b"x")
+
+    error = admin.copy_uf2(uf2, tmp_path / "no-such-volume")
+    assert isinstance(error, OSError)
+
+
+def _flash_harness(tmp_path, monkeypatch, block_device_polls, copy_error=None):
+    """cmd_flash with every board-facing call faked.
+
+    The BOOTSEL block device stays listed for `block_device_polls` polls, then
+    goes. Returns the list of events in the order cmd_flash caused them.
+    """
+    uf2 = tmp_path / "image.uf2"
+    uf2.write_bytes(b"x")
+    volume = tmp_path / "RPI-RP2"
+    volume.mkdir()
+    events = []
+    remaining = [block_device_polls]
+
+    def fake_block_devices(prefix):
+        assert prefix == PORT
+        if remaining[0] > 0:
+            remaining[0] -= 1
+            events.append("bootsel present")
+            return ["/dev/sda1"]
+        events.append("bootsel gone")
+        return []
+
+    def fake_wait_for_serial_port(**kwargs):
+        events.append(("reboot wait", kwargs))
+        return "/dev/ttyACM1"
+
+    monkeypatch.setattr(admin, "select_port", lambda args: ("/dev/ttyACM0", "RR-X"))
+    monkeypatch.setattr(admin, "port_topology", lambda device: PORT)
+    monkeypatch.setattr(admin, "roadrunner_ports", lambda: [("/dev/ttyACM0", "RR-X")])
+    monkeypatch.setattr(admin, "guard_destructive", lambda *a: None)
+    monkeypatch.setattr(admin, "reboot_bootsel", lambda device: None)
+    monkeypatch.setattr(admin, "wait_for_bootsel_mount", lambda prefix: volume)
+    monkeypatch.setattr(admin, "copy_uf2", lambda u, v: events.append("copy") or copy_error)
+    monkeypatch.setattr(admin, "bootsel_block_devices", fake_block_devices)
+    monkeypatch.setattr(admin, "wait_for_serial_port", fake_wait_for_serial_port)
+    monkeypatch.setattr(admin, "info", lambda port: {})
+    monkeypatch.setattr(admin, "print_info", lambda result: None)
+    monkeypatch.setattr(admin.time, "sleep", lambda seconds: None)
+
+    args = admin.argparse.Namespace(uf2=str(uf2), port="/dev/ttyACM0", serial=None, yes=True)
+    return args, events
+
+
+def test_flash_starts_the_reboot_timeout_only_after_the_image_is_applied(
+    tmp_path, monkeypatch
+):
+    """A slow host is still writing the image when the copy call returns.
+
+    Starting the re-enumeration timeout then made a successful flash report
+    "no Roadrunner re-enumerated". The timeout must start once the BOOTSEL
+    volume has gone.
+    """
+    args, events = _flash_harness(tmp_path, monkeypatch, block_device_polls=50)
+
+    assert admin.cmd_flash(args) == admin.EXIT_OK
+    reboot_wait = [i for i, e in enumerate(events) if isinstance(e, tuple)]
+    assert len(reboot_wait) == 1
+    assert events[0] == "copy"
+    assert events[reboot_wait[0] - 1] == "bootsel gone"
+    assert events.count("bootsel present") == 50
+    # Waiting for the old port to disappear would stall on a board that is
+    # already back.
+    assert not events[reboot_wait[0]][1].get("expect_disconnect")
+
+
+def test_flash_reports_an_image_the_board_never_applied(tmp_path, monkeypatch):
+    args, events = _flash_harness(tmp_path, monkeypatch, block_device_polls=10**9)
+    clock = iter(range(0, 10**6))
+    monkeypatch.setattr(admin.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(admin.NoBoardError, match="has not applied the image"):
+        admin.cmd_flash(args)
+    assert not any(isinstance(e, tuple) for e in events)
+
+
+def test_flash_surfaces_a_copy_error_when_the_volume_stays(tmp_path, monkeypatch):
+    args, events = _flash_harness(
+        tmp_path, monkeypatch, block_device_polls=10**9,
+        copy_error=OSError(28, "No space left on device"),
+    )
+    clock = iter(range(0, 10**6))
+    monkeypatch.setattr(admin.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(admin.RoadrunnerError, match="No space left"):
+        admin.cmd_flash(args)
+
+
+def test_flash_accepts_a_copy_error_when_the_board_rebooted(tmp_path, monkeypatch):
+    """The ROM resets on the last block; a close that then fails is success."""
+    args, events = _flash_harness(
+        tmp_path, monkeypatch, block_device_polls=3,
+        copy_error=OSError(5, "Input/output error"),
+    )
+
+    assert admin.cmd_flash(args) == admin.EXIT_OK
+
+
 def test_mount_points_unescape_octal(tmp_path, monkeypatch):
     """/proc/mounts escapes the characters that would break its own parsing."""
     proc = tmp_path / "mounts"

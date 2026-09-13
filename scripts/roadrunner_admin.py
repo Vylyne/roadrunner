@@ -681,6 +681,50 @@ def wait_for_bootsel_mount(prefix: str | None = None, timeout: float = 10) -> Pa
     )
 
 
+def copy_uf2(uf2: Path, volume: Path) -> OSError | None:
+    """Copy `uf2` onto the boot ROM volume and push it through to the board.
+
+    shutil.copy returns once the kernel holds the bytes, not once the board
+    has them. Linux can sit on dirty pages for tens of seconds before writing
+    them out, so a reboot timeout started at that point can expire before the
+    board has seen the last block. fsync makes returning mean "sent".
+
+    The error is returned rather than raised: the ROM reboots the moment the
+    last block lands, so the flush or close can fail because the device has
+    already gone, which is success. Only wait_for_bootsel_gone can tell.
+    """
+    try:
+        with open(uf2, "rb") as source, open(volume / uf2.name, "wb") as dest:
+            shutil.copyfileobj(source, dest)
+            dest.flush()
+            os.fsync(dest.fileno())
+    except OSError as exc:
+        return exc
+    return None
+
+
+def bootsel_present(volume: Path, prefix: str | None) -> bool:
+    """Whether the boot ROM volume we copied to is still there."""
+    if prefix is not None:
+        return bool(bootsel_block_devices(prefix))
+    try:
+        return (volume / BOOTSEL_MARKER).is_file()
+    except OSError:
+        return False
+
+
+def wait_for_bootsel_gone(
+    volume: Path, prefix: str | None, timeout: float
+) -> bool:
+    """Wait for the board to take the image and drop its BOOTSEL volume."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not bootsel_present(volume, prefix):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 # --------------------------------------------------------------------------
 # Formatting
 # --------------------------------------------------------------------------
@@ -915,14 +959,29 @@ def cmd_flash(args) -> int:
             if input("Flash it? [y/N] ").strip().lower() not in ("y", "yes"):
                 raise RoadrunnerError("cancelled")
 
-    shutil.copy(uf2, volume / uf2.name)
-    print(f"copied {uf2.name}; waiting for the board to come back")
+    copy_error = copy_uf2(uf2, volume)
+    print(f"sent {uf2.name}; waiting for the board to apply it")
+
+    # The reboot timeout starts only once the volume has gone. Until then the
+    # board is still receiving or writing the image, and how long that takes
+    # depends on the host, not the board.
+    apply_timeout = 60 if copy_error is None else 10
+    if not wait_for_bootsel_gone(volume, prefix, apply_timeout):
+        if copy_error is not None:
+            raise RoadrunnerError(
+                f"copying {uf2.name} to {volume} failed: {copy_error}"
+            )
+        raise NoBoardError(
+            f"{volume} was still there {apply_timeout}s after the copy; "
+            f"the board has not applied the image"
+        )
+    print("image applied; waiting for the board to come back")
 
     # A normal UF2 update preserves the identity sector, so a provisioned
-    # board stays provisioned and an erased sector stays erased.
-    port = wait_for_serial_port(
-        known_before=others, prefix=prefix, timeout=20, expect_disconnect=True
-    )
+    # board stays provisioned and an erased sector stays erased. No
+    # expect_disconnect: the serial port went away before BOOTSEL mounted, and
+    # a board that re-enumerates quickly would otherwise be waited out.
+    port = wait_for_serial_port(known_before=others, prefix=prefix, timeout=20)
     print_info(info(port))
     return EXIT_OK
 
