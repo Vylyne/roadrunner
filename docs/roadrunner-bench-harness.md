@@ -6,7 +6,16 @@ printer hardware is production hardware, and a toolhead or installed sensor is
 never a test target.
 
 Status: built and running, 2026-09-13. Klipper host is a Raspberry Pi rather
-than WSL2. I2C bring-up passed on the first attempt; UART not yet exercised.
+than WSL2. I2C and UART bring-up both passed: the DUT answers on each, and its
+provisioned identity survived the I2C → UART reflash. Open items on the rig:
+
+- The thermistor reads a steady ~285 °C with both resistors on `gpio27`, which
+  fits the 4.7 kΩ and 100 kΩ being swapped (~280 °C predicted). Inside
+  `max_temp`, so it does not block work; to be re-checked with a meter.
+- `roadrunner_admin.py flash` exited 3, "no Roadrunner re-enumerated within
+  20s", although the flash succeeded: the UF2 copy took ~39 s to reach the board
+  and it came back ~1 s after that. The 20 s wait starts before the copy has
+  landed.
 
 ## Shape
 
@@ -61,7 +70,7 @@ both transports with no rewiring.
 | GP9 | 330 Ω | GP4 | UART: master RX ← DUT TX |
 | GP8 | 330 Ω | GP5 | UART: master TX → DUT RX |
 | GND | — | GND | required, see below |
-| GP26 | 4.7 kΩ to 3V3 **and** 100 kΩ to GND | — | fake thermistor |
+| GP27 | 4.7 kΩ to 3V3 **and** 100 kΩ to GND | — | fake thermistor |
 
 Both boards take power from their own USB connection to the host. **Run an
 explicit ground strap anyway** — grounding only through two USB cables and the
@@ -164,7 +173,7 @@ nozzle_diameter: 0.4
 filament_diameter: 1.75
 heater_pin: gpio13
 sensor_type: Generic 3950
-sensor_pin: gpio26
+sensor_pin: gpio27
 control: pid
 pid_Kp: 20.0
 pid_Ki: 1.0
@@ -183,15 +192,25 @@ talk to a real driver over UART and fail at startup when nothing answers.
 **The thermistor is the only part that must be real**, because it is the only
 input Klipper actually reads — an out-of-range ADC is a startup fault.
 
-It takes **two** resistors: 4.7 kΩ from `gpio26` to 3V3, and 100 kΩ from `gpio26`
-to GND. `pullup_resistor: 4700` is not a resistor Klipper provides — it is the
+It takes **two** resistors: 4.7 kΩ (yellow violet black brown brown) from
+`gpio27` to 3V3, and 100 kΩ (brown black black orange brown) from `gpio27` to
+GND. `pullup_resistor: 4700` is not a resistor Klipper provides — it is the
 value Klipper *assumes* a printer board has fitted, used only in the conversion
-math. A bare RP2040-Zero has no such pull-up. With the 100 kΩ alone the ADC pin
-is barely driven, and on the first build of this rig it read a wandering
-171–177 °C instead of 25 °C. That stays inside `min_temp`/`max_temp` so nothing
-faults — which is the trap: it drifts, and a drift past either limit shuts the
-bench down mid-test for a reason unrelated to the sensor. With both resistors
-fitted the divider reads about 25 °C under `Generic 3950`.
+math. A bare RP2040-Zero has no such pull-up.
+
+A wrong thermistor reading is a trap because it usually stays inside
+`min_temp`/`max_temp`, so nothing faults — until it drifts past a limit and
+shuts the bench down mid-test for a reason unrelated to the sensor. What to
+expect under `Generic 3950`:
+
+| Pin state | Voltage | Reads |
+| --- | --- | --- |
+| 4.7 kΩ to 3V3, 100 kΩ to GND (correct) | ~3.15 V | ~25 °C |
+| 100 kΩ to 3V3, 4.7 kΩ to GND (swapped) | ~0.15 V | ~280 °C |
+| `sensor_pin` names an unwired ADC pin | floating | wanders; 171–177 °C seen |
+
+The floating row is from this rig's first build, where the resistors were on
+`gpio27` and the config named `gpio26`.
 
 ### I2C
 
