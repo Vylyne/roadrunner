@@ -239,6 +239,10 @@ directly on the sensor transport itself:
 | `0x34` | `READ_FLASH_UID` | 8 | Raw diagnostic bytes |
 | `0x35` | `READ_IMAGE_DIGEST` | 4 | CRC-32/ISO-HDLC of the image, little-endian |
 | `0x36` | `READ_IMAGE_RANGE` | 8 | Image start, then image length, both little-endian |
+| `0x37`–`0x3E` | `READ_SERIAL` chunks 0–7 | 4 each | Chunk `n` is bytes `[4n, 4n+4)` of `0x31` |
+| `0x3F` | — | — | Reserved; refused like any unassigned register |
+| `0x40`–`0x47` | `READ_FIRMWARE_VERSION` chunks 0–7 | 4 each | Chunk `n` is bytes `[4n, 4n+4)` of `0x32` |
+| `0x48`–`0x49` | `READ_IMAGE_RANGE` chunks 0–1 | 4 each | Chunk 0 is the start, chunk 1 the length |
 
 These registers are readable over I2C, UART, and usbserial, whether or
 not the board is provisioned — they are both the unprovisioned allow-list and
@@ -247,18 +251,26 @@ the steady-state identity source. Field order and encoding mirror the USB
 what a Roadrunner's identity is, with `INFO` and this window as two
 encodings of it.
 
-**A UART host can only read the two short registers.** Klipper's MCU-side
+**A UART host reads no register wider than four bytes.** Klipper's MCU-side
 `tmcuart` buffer is ten bytes (`uint8_t data[10]` in `klipper/src/tmcuart.c`),
 and a request for more is `shutdown("tmcuart data too large")` — an MCU
 shutdown, not a failed read. The bit-banged read asks for
 `(((4 + reg_length) * 10) + 7) // 8` bytes, which reaches exactly ten at a
 four-byte register, so four bytes is a hard ceiling on that transport.
 `READ_IDENTITY_STATE` (1), `READ_VARIANT` (2) and `READ_IMAGE_DIGEST` (4)
-fit; `READ_SERIAL` (32), `READ_FIRMWARE_VERSION` (32), `READ_FLASH_UID` (8)
-and `READ_IMAGE_RANGE` (8) do not, and a host must not attempt them over
-UART. Serving them there would need the firmware to
-offer the window in four-byte chunks, which it does not. I2C and usbserial
-carry the whole window.
+fit. `READ_SERIAL`, `READ_FIRMWARE_VERSION` and `READ_IMAGE_RANGE` do not, and
+a UART host reads them through their chunk registers (`0x37`–`0x49`) instead,
+never through the wide register. `READ_FLASH_UID` (8) has no chunks and is
+not readable over UART at all. I2C and usbserial carry the whole window and
+can read either form.
+
+Chunks are stateless: each is a plain slice of its wide register, so any one
+can be read or retried on its own and there is no cursor for two bus masters
+to fight over. A host may stop reading `READ_SERIAL` or
+`READ_FIRMWARE_VERSION` chunks after the one holding the first NUL, since the
+rest is padding. It must always read both `READ_IMAGE_RANGE` chunks: the range
+is binary, and a zero byte there is a value. See
+`roadrunner-uart-chunked-identity-design.md`.
 
 **The identity register window is read-only in this release.** There is no
 write path on I2C or UART: `i2c_target.c` reads and discards every byte after
@@ -278,17 +290,17 @@ definition rather than carrying an algorithm byte, which is what lets it fit
 the four-byte UART ceiling. INFO's digest field is self-describing because
 INFO is a versioned payload where a future algorithm change has to be
 expressible; a different register algorithm would take a different register
-number instead. A UART host therefore reads the digest value but cannot read
-`READ_IMAGE_RANGE`, so it can compare two boards or compare a board against a
-number it recorded earlier, but it cannot reconstruct the range from a UF2.
+number instead. Together with the range chunks at `0x48`–`0x49`, that gives a
+UART host everything it needs to reconstruct the digested range from a UF2 and
+check the board against the file.
 
 A board that has no digest to report — algorithm `NONE` in `INFO` — declines
 `READ_IMAGE_DIGEST` outright rather than answering, because `0x00000000` is
 itself a legal CRC and this register has no room to say "none". The refusal
 reads as a zero-length answer, not as a value: hosts must treat a short or
 empty read of `0x35` as "no digest", never as a digest of zero.
-`READ_IMAGE_RANGE` (`0x36`) still answers, since which bytes a digest would
-cover is useful even when there is no digest.
+`READ_IMAGE_RANGE` (`0x36`) and its chunks still answer, since which bytes a
+digest would cover is useful even when there is no digest.
 
 Hosts must not persist the flash UID (`0x34`) as an identity; it is a
 diagnostic value only and is not guaranteed unique across boards from the
@@ -298,7 +310,7 @@ same batch.
 
 While the board has no valid identity — `READ_IDENTITY_STATE` is anything
 other than `1` (`OK`), which includes `CONFLICT` and `IO_ERROR`, not only
-`NONE` — every register outside the identity window (`0x30`–`0x36`) returns
+`NONE` — every register outside the identity window (`0x30`–`0x49`) returns
 its normal length filled with `0xFF`. A host must read `READ_IDENTITY_STATE`
 (`0x30`) to distinguish a locked board from a genuine sensor fault — `0xFF`
 is out of range for almost every field, so an unpatched host reads visibly

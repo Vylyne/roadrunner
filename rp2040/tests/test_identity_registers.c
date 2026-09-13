@@ -207,9 +207,109 @@ static void test_ignores_unknown_registers(void) {
     assert(!rr_identity_registers_read(0x10u, buf, &length));
     assert(length == 0xdeadu);
     assert(!rr_identity_registers_read(0x24u, buf, &length));
-    /* 0x35 and 0x36 became the image-digest registers; 0x37 is the first
-     * address past the window and is the one that must stay unknown. */
-    assert(!rr_identity_registers_read(0x37u, buf, &length));
+    /* 0x3F is reserved inside the window, and 0x4A is the first address past
+     * it. Both must stay unknown. */
+    assert(!rr_identity_registers_read(0x3fu, buf, &length));
+    assert(length == 0xdeadu);
+    assert(!rr_identity_registers_read(0x4au, buf, &length));
+    assert(length == 0xdeadu);
+}
+
+/* Reads chunks `base`.. of a field and checks each is exactly four bytes, that
+ * only four bytes were written, and that together they equal `expected`. */
+static void assert_chunks(uint8_t base, size_t chunks, const uint8_t *expected) {
+    for (size_t index = 0; index < chunks; ++index) {
+        uint8_t buf[64];
+        size_t length = 0u;
+
+        memset(buf, 0x5a, sizeof(buf));
+        assert(rr_identity_registers_read((uint8_t)(base + index), buf,
+                                          &length));
+        assert(length == RR_REG_CHUNK_SIZE);
+        assert(memcmp(buf, expected + index * RR_REG_CHUNK_SIZE,
+                      RR_REG_CHUNK_SIZE) == 0);
+        assert(buf[RR_REG_CHUNK_SIZE] == 0x5au);
+    }
+}
+
+static void test_chunk_register_numbers(void) {
+    /* docs/roadrunner-uart-chunked-identity-design.md, "Register allocation".
+     * Hosts hard-code these, so they are pinned against the document. */
+    assert(RR_REG_SERIAL_CHUNK_BASE == 0x37);
+    assert(RR_REG_SERIAL_CHUNKS == 8u);
+    assert(RR_REG_FIRMWARE_VERSION_CHUNK_BASE == 0x40);
+    assert(RR_REG_FIRMWARE_VERSION_CHUNKS == 8u);
+    assert(RR_REG_IMAGE_RANGE_CHUNK_BASE == 0x48);
+    assert(RR_REG_IMAGE_RANGE_CHUNKS == 2u);
+    assert(RR_REG_IDENTITY_WINDOW_LAST == 0x49);
+}
+
+static void test_serial_chunks_carry_the_provisioned_serial(void) {
+    uint8_t expected[RR_REG_SERIAL_SIZE] = {0};
+    struct rr_usb_descriptor_strings strings;
+
+    configure(RR_IDENTITY_OK);
+    rr_usb_descriptor_strings_build(&strings, RR_IDENTITY_OK, &test_identity);
+    assert(strlen(strings.serial) == 29u);
+    memcpy(expected, strings.serial, 29u);
+
+    /* Chunk 7 carries the last character and three zero bytes. */
+    assert_chunks(RR_REG_SERIAL_CHUNK_BASE, RR_REG_SERIAL_CHUNKS, expected);
+}
+
+static void test_serial_chunks_carry_the_unprovisioned_serial(void) {
+    static const uint8_t expected[RR_REG_SERIAL_SIZE] = "RR-UNPROVISIONED";
+
+    configure(RR_IDENTITY_NONE);
+    /* Sixteen characters fill chunks 0-3 exactly; the terminator is chunk 4,
+     * so a host stopping at the first NUL reads five chunks, not four. */
+    assert_chunks(RR_REG_SERIAL_CHUNK_BASE, RR_REG_SERIAL_CHUNKS, expected);
+}
+
+static void test_firmware_version_chunks(void) {
+    static const uint8_t expected[RR_REG_FIRMWARE_VERSION_SIZE] = "test-1.2.3";
+
+    configure(RR_IDENTITY_OK);
+    assert_chunks(RR_REG_FIRMWARE_VERSION_CHUNK_BASE,
+                  RR_REG_FIRMWARE_VERSION_CHUNKS, expected);
+}
+
+static void test_image_range_chunks(void) {
+    /* Start, then length, each little-endian: 0x10000000 and 600. */
+    static const uint8_t expected[RR_REG_IMAGE_RANGE_SIZE] = {
+        0x00, 0x00, 0x00, 0x10, 0x58, 0x02, 0x00, 0x00,
+    };
+
+    configure(RR_IDENTITY_OK);
+    install_golden_image();
+    assert_chunks(RR_REG_IMAGE_RANGE_CHUNK_BASE, RR_REG_IMAGE_RANGE_CHUNKS,
+                  expected);
+
+    /* Like 0x36, the range chunks answer even with no digest to cover. */
+    rr_image_digest_init(NULL, GOLDEN_IMAGE_START, GOLDEN_IMAGE_LENGTH);
+    assert_chunks(RR_REG_IMAGE_RANGE_CHUNK_BASE, RR_REG_IMAGE_RANGE_CHUNKS,
+                  expected);
+    install_golden_image();
+}
+
+static void test_every_chunk_readable_while_locked(void) {
+    uint8_t buf[64];
+    size_t length = 0u;
+
+    /* A locked board still has to say which board and which build it is -
+     * that is the reason the window is outside the gate. */
+    configure(RR_IDENTITY_NONE);
+    install_golden_image();
+    assert(rr_identity_registers_locked());
+    for (unsigned reg = RR_REG_SERIAL_CHUNK_BASE;
+         reg <= RR_REG_IDENTITY_WINDOW_LAST; ++reg) {
+        if (reg == 0x3fu) {
+            continue;
+        }
+        length = 0u;
+        assert(rr_identity_registers_read((uint8_t)reg, buf, &length));
+        assert(length == RR_REG_CHUNK_SIZE);
+    }
 }
 
 static void test_locked_without_a_valid_identity(void) {
@@ -299,6 +399,12 @@ int main(void) {
     test_image_digest_register_refuses_without_a_digest();
     test_image_registers_readable_while_locked();
     test_ignores_unknown_registers();
+    test_chunk_register_numbers();
+    test_serial_chunks_carry_the_provisioned_serial();
+    test_serial_chunks_carry_the_unprovisioned_serial();
+    test_firmware_version_chunks();
+    test_image_range_chunks();
+    test_every_chunk_readable_while_locked();
     test_locked_without_a_valid_identity();
     test_unlocked_once_provisioned();
     test_identity_window_readable_while_locked();

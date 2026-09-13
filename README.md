@@ -22,7 +22,8 @@
 - [x] Direct USB maintenance and ROM BOOTSEL recovery
 - [x] A board without a valid identity refuses to serve sensor data
 - [x] Board identity, firmware version and variant in the Klipper printer
-  object, for host tools to map a sensor to its USB device
+  object, for host tools to map a sensor to its USB device - on every
+  transport, UART included
 - [x] A digest of the firmware image the board is actually running, so a host
   tool can tell a bad or mismatched flash write from a good one
 
@@ -66,14 +67,6 @@ extra's on-connect path — every route above ultimately goes over USB.
   reproduces what the board reports for a real build, and that the ~16 ms
   first-read cost does not disturb the sensor poll. Nothing in this feature
   has run on hardware yet.
-- [ ] Make a UART-wired board identifiable from the printer object. Klipper's
-  ten-byte `tmcuart` buffer caps that transport at four-byte registers, so
-  `identity.serial` and `identity.firmware_version` are null there and a host
-  tool cannot tell one UART board from another. Specced in
-  [docs/roadrunner-uart-chunked-identity-design.md](docs/roadrunner-uart-chunked-identity-design.md)
-  (accepted, unimplemented): serve the identity window in four-byte chunks.
-  The alternative is the extra's planned on-connect USB admin path.
-
 - [ ] Provision an unprovisioned board from Klipper instead of from a
   workstation. A board wired for I2C or UART has no USB host attached, so
   setting its identity today means unplugging it. Specced in
@@ -242,11 +235,13 @@ rather than going quiet, so without this field a refusing board and a dead one
 look the same; the extra logs and reports the reason instead, and points at
 `scripts/roadrunner_admin.py`.
 
-**On a UART-wired board, `serial` and `firmware_version` are always `null`.**
+**On a UART-wired board the identity fills in over the first few polls.**
 Klipper's MCU-side `tmcuart` buffer holds ten bytes, and asking for more is an
 MCU shutdown rather than a failed read, which caps this transport at four-byte
-registers. `state` and the variant fields fit; the two strings do not. I2C and
-usbserial report everything.
+registers. The firmware serves the serial, firmware version and image range a
+second time as four-byte chunks, and the extra reads a few chunks per sensor
+poll rather than stalling one poll for all of them. Until the read completes
+the fields stay `null`. I2C and usbserial read each field in one transaction.
 
 `firmware_image` answers a different question from `identity.firmware_version`.
 The version is a string the build stamps in - it says which source the board
@@ -268,9 +263,8 @@ in question, so anything able to replace the image can replace the hasher and
 report whatever it likes. It is evidence against accident, never against
 substitution; which bytes were actually written stays a host-side record.
 
-Over UART the digest is present but `start` and `length` are `null`: the
-four-byte digest register fits the `tmcuart` ceiling and the eight-byte range
-register does not. That is enough to tell two boards apart or to compare a
+If the range fails to read, the digest is still reported with `start` and
+`length` as `null`. That is enough to tell two boards apart or to compare a
 board against a number recorded earlier, not enough to check one against a
 file.
 

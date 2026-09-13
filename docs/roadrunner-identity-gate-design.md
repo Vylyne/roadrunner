@@ -154,7 +154,11 @@ A new register range, chosen to clear the existing sensor map (`0x10`,
 | `0x33` | `READ_VARIANT` | 2 | transport byte, LED-order byte — same values as the USB `INFO` payload |
 | `0x34` | `READ_FLASH_UID` | 8 | Raw diagnostic bytes. **Hosts must not persist this** |
 
-These five registers are **always readable**, provisioned or not. They are the
+The window has since grown: the image digest and range at `0x35`–`0x36`, and
+four-byte chunks of the serial, firmware version and range at `0x37`–`0x49`
+for UART hosts. `roadrunner-usb-admin-protocol.md` holds the current table.
+
+All of these registers are **always readable**, provisioned or not. They are the
 unprovisioned allow-list and the steady-state identity source, and one
 definition serves both — there is no separate "provisioning mode."
 

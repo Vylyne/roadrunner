@@ -32,6 +32,14 @@ static void rr_identity_registers_copy_string(uint8_t *buf, size_t size,
     }
 }
 
+static bool rr_identity_registers_read_chunk(uint8_t reg, uint8_t *buf,
+                                             size_t *length);
+
+/* read_chunk stages a whole field in a SERIAL-sized buffer. */
+_Static_assert(RR_REG_FIRMWARE_VERSION_SIZE <= RR_REG_SERIAL_SIZE
+               && RR_REG_IMAGE_RANGE_SIZE <= RR_REG_SERIAL_SIZE,
+               "every chunked field must fit the staging buffer");
+
 /* Little-endian, matching the INFO payload's two 32-bit fields. */
 static void rr_identity_registers_put_u32(uint8_t *buf, uint32_t value)
 {
@@ -116,8 +124,46 @@ bool rr_identity_registers_read(uint8_t reg, uint8_t *buf, size_t *length)
     }
 
     default:
-        return false;
+        return rr_identity_registers_read_chunk(reg, buf, length);
     }
+}
+
+/* A chunk is a slice of the wide register's own buffer, so there is one source
+ * for each field and a chunked read can never disagree with the wide one. */
+static bool rr_identity_registers_read_chunk(uint8_t reg, uint8_t *buf,
+                                             size_t *length)
+{
+    static const struct {
+        uint8_t base;
+        uint8_t chunks;
+        uint8_t field;
+    } runs[] = {
+        {RR_REG_SERIAL_CHUNK_BASE, RR_REG_SERIAL_CHUNKS, RR_REG_SERIAL},
+        {RR_REG_FIRMWARE_VERSION_CHUNK_BASE, RR_REG_FIRMWARE_VERSION_CHUNKS,
+         RR_REG_FIRMWARE_VERSION},
+        {RR_REG_IMAGE_RANGE_CHUNK_BASE, RR_REG_IMAGE_RANGE_CHUNKS,
+         RR_REG_IMAGE_RANGE},
+    };
+    uint8_t field[RR_REG_SERIAL_SIZE];
+    size_t field_length = 0u;
+
+    for (size_t index = 0; index < sizeof(runs) / sizeof(runs[0]); ++index) {
+        size_t offset;
+
+        if (reg < runs[index].base
+            || reg >= runs[index].base + runs[index].chunks) {
+            continue;
+        }
+        if (!rr_identity_registers_read(runs[index].field, field,
+                                        &field_length)) {
+            return false;
+        }
+        offset = (size_t)(reg - runs[index].base) * RR_REG_CHUNK_SIZE;
+        memcpy(buf, field + offset, RR_REG_CHUNK_SIZE);
+        *length = RR_REG_CHUNK_SIZE;
+        return true;
+    }
+    return false;
 }
 
 bool rr_identity_registers_locked(void)

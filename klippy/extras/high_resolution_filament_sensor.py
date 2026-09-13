@@ -107,6 +107,15 @@ class IdentityRegister:
         IMAGE_RANGE: 8,
     }
 
+# Returned by read_identity() / read_firmware_image() when a chunked read used
+# up this attempt's budget part-way. Distinct from None, which means the board
+# did not answer: nothing failed, so the caller carries on at the next poll
+# rather than waiting out the retry timer.
+READ_PENDING = object()
+
+class _ChunkBudgetSpent(Exception):
+    """ Unwinds a chunked read out of read_identity() without a result. """
+
 TRANSPORT_NAMES : dict[int, str] = {1: "i2c", 2: "uart", 3: "usb"}
 LED_ORDER_NAMES : dict[int, str] = {1: "rgb", 2: "grb"}
 
@@ -126,10 +135,10 @@ class FirmwareImage:
     Treat it as evidence against accident, never against substitution.
 
     `start` and `length` are what a host needs to reconstruct the same byte
-    range out of a .uf2 and compare. They come from a separate register that
-    does not fit the UART transport, so over UART the digest arrives without
-    them - still enough to tell two boards apart, not enough to check one
-    against a file. """
+    range out of a .uf2 and compare. They come from a separate register, so a
+    board can report a digest whose range failed to read; the digest alone is
+    still enough to tell two boards apart, not enough to check one against a
+    file. """
 
     def __init__(self, digest : typing.Optional[int],
                  start : typing.Optional[int] = None,
@@ -181,8 +190,8 @@ class SensorIdentity:
 
     Static between reboots, so it is read once and cached. `state` is the
     anchor: it is the authoritative explanation for a board that answers but
-    refuses to report sensor data. The remaining fields are best-effort,
-    because not every transport can carry them - see RegisterReaderUART. """
+    refuses to report sensor data. The remaining fields are best-effort: one
+    that fails to read is left None rather than costing the state. """
 
     def __init__(self, state : typing.Optional[int], serial : typing.Optional[str] = None,
                  firmware_version : typing.Optional[str] = None,
@@ -316,6 +325,12 @@ class RegisterReaderGeneric:
     def read_reg(self, reg : int, length : int) -> typing.Optional[bytearray]:
         raise NotImplementedError('must be implemented in subclass')
 
+    def discard_partial_reads(self):
+        """ Forget any half-assembled identity field. Called when the board
+        reconnects, since the board that came back may not be the one that
+        went away. Only a transport that assembles fields across attempts has
+        anything to forget. """
+
     def decode_all(self, data : typing.Optional[bytearray]) -> typing.Optional[SensorRegister]:
         """ Decode a READ_ALL payload, shared by the transports that read it
         in one go. """
@@ -402,23 +417,98 @@ class RegisterReaderUART(RegisterReaderGeneric):
     # bytes, which reaches exactly 10 at a 4-byte register, so four bytes is a
     # hard ceiling on this transport.
     #
-    # That leaves STATE (1) and VARIANT (2) readable. SERIAL (32) and
-    # FIRMWARE_VERSION (32) are not, and are reported as None rather than
-    # attempted: reading them here would require the firmware to offer the
-    # window in four-byte chunks, which it does not.
+    # So the firmware serves SERIAL, FIRMWARE_VERSION and IMAGE_RANGE a second
+    # time as runs of stateless four-byte chunks - chunk n is base + n - and
+    # read_reg() reassembles them. A long register with no chunk run is still
+    # refused rather than attempted.
     MAX_REGISTER_LENGTH = 4
-    identity_registers = (IdentityRegister.STATE, IdentityRegister.VARIANT)
-    # The digest is exactly four bytes and fits; the range register is eight
-    # and does not. A UART host gets a number it can compare against another
-    # board or against one it recorded earlier, but cannot reconstruct the
-    # range out of a .uf2 to check the board against a file.
-    image_registers = (IdentityRegister.IMAGE_DIGEST,)
+    CHUNK_BASES : dict[int, int] = {
+        IdentityRegister.SERIAL: 0x37,
+        IdentityRegister.FIRMWARE_VERSION: 0x40,
+        IdentityRegister.IMAGE_RANGE: 0x48,
+    }
+    # NUL-padded strings: the chunk holding the terminator is the last one
+    # worth asking for. IMAGE_RANGE is binary and 0x00000000 is a legal start
+    # address, so a zero byte there is a value and it is always read in full.
+    TEXT_REGISTERS = (IdentityRegister.SERIAL, IdentityRegister.FIRMWARE_VERSION)
+    # A full identity is up to 18 chunk transactions, on top of the four the
+    # sensor poll makes itself. Spread them over polls instead of stalling one.
+    CHUNKS_PER_ATTEMPT = 6
 
     def __init__(self, uart):
         self.uart = uart
+        # Chunks read so far, per field, kept between attempts so a field can
+        # complete across several polls. That is safe only because an identity
+        # cannot change without a reboot, and a reboot comes back through
+        # discard_partial_reads() - see "Tearing" in
+        # docs/roadrunner-uart-chunked-identity-design.md.
+        #
+        # A field that failed holds None instead, so the attempts that follow
+        # report it missing rather than spend their budget failing it again.
+        # Everything here is dropped once a whole read completes.
+        self._chunks : dict[int, typing.Optional[bytearray]] = {}
+        self._chunk_budget : typing.Optional[int] = None
+
+    def read_identity(self):
+        return self._within_chunk_budget(super().read_identity)
+
+    def read_firmware_image(self):
+        return self._within_chunk_budget(super().read_firmware_image)
+
+    def discard_partial_reads(self):
+        self._chunks.clear()
+
+    def _within_chunk_budget(self, read):
+        # Identity and image reads never interleave - the image is only read
+        # once the identity has completed - so a completed read can drop
+        # every field, not just its own.
+        self._chunk_budget = self.CHUNKS_PER_ATTEMPT
+        try:
+            result = read()
+        except _ChunkBudgetSpent:
+            return READ_PENDING
+        finally:
+            self._chunk_budget = None
+        self._chunks.clear()
+        return result
+
+    def _read_chunked(self, reg, length):
+        """ Reassemble a wide register from its chunks.
+
+        Retries are per chunk, inside uart_read_reg(), so one flaky slice
+        does not restart the others. A chunk that still fails loses the whole
+        field: the caller gets None, never a truncated string. """
+        size = self.MAX_REGISTER_LENGTH
+        budgeted = self._chunk_budget is not None
+        if budgeted:
+            if reg in self._chunks and self._chunks[reg] is None:
+                return None
+            field = self._chunks.setdefault(reg, bytearray())
+        else:
+            field = bytearray()
+        while len(field) < length:
+            if reg in self.TEXT_REGISTERS and 0 in field:
+                break
+            if budgeted:
+                if self._chunk_budget <= 0:
+                    raise _ChunkBudgetSpent()
+                self._chunk_budget -= 1
+            chunk = self.uart_read_reg(
+                self.CHUNK_BASES[reg] + len(field) // size, size)
+            if chunk is None or len(chunk) != size:
+                logging.warning("Chunk %d of register %02x failed; reporting "
+                                "the field as unreadable"
+                                % (len(field) // size, reg))
+                if budgeted:
+                    self._chunks[reg] = None
+                return None
+            field += chunk
+        return bytearray(field[:length]).ljust(length, b"\x00")
 
     def read_reg(self, reg, length):
         if length > self.MAX_REGISTER_LENGTH:
+            if reg in self.CHUNK_BASES:
+                return self._read_chunked(reg, length)
             logging.warning(
                 "Not reading register %02x over uart: it is %d bytes and "
                 "Klipper's tmcuart buffer holds %d, which would shut down the "
@@ -1137,6 +1227,7 @@ class HighResolutionFilamentSensor:
             self._identity = None
             self._firmware_image = None
             self._identity_next_attempt = 0.
+            self.regs.discard_partial_reads()
         if new_value:
             self._respond_info("Reconnected")
         else:
@@ -1184,9 +1275,23 @@ class HighResolutionFilamentSensor:
             # registers now would only add failures to the same retry.
             return
 
+        if identity is READ_PENDING:
+            # A chunked read spent this attempt's budget. Nothing failed, so
+            # carry on at the next poll rather than the retry timer.
+            self._identity_next_attempt = eventtime
+            return
+
         if self._identity is None:
             self._identity = identity
             logging.info(f"{self.name}: identity {identity!r}")
+            if not identity.provisioned:
+                # The one thing this whole window exists to make sayable: the
+                # board is answering, and it is refusing on purpose. Said once
+                # per read, not again on every attempt at the image registers.
+                self._respond_error(
+                    f"board is not provisioned (identity {identity.state}), so "
+                    f"it refuses to report sensor data. Provision it with "
+                    f"scripts/roadrunner_admin.py over USB.")
 
         if self._firmware_image is None:
             try:
@@ -1195,17 +1300,11 @@ class HighResolutionFilamentSensor:
                 logging.exception(
                     f"{self.name}: reading the image digest registers failed")
                 image = None
-            if image is not None:
+            if image is READ_PENDING:
+                self._identity_next_attempt = eventtime
+            elif image is not None:
                 self._firmware_image = image
                 logging.info(f"{self.name}: firmware image {image!r}")
-
-        if not identity.provisioned:
-            # The one thing this whole window exists to make sayable: the
-            # board is answering, and it is refusing on purpose.
-            self._respond_error(
-                f"board is not provisioned (identity {identity.state}), so it "
-                f"refuses to report sensor data. Provision it with "
-                f"scripts/roadrunner_admin.py over USB.")
 
     def _update_state_from_sensor(self):
         """ Read data from sensor and sets the internal state to match. """

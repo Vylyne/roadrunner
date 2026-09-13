@@ -1,8 +1,9 @@
 # Roadrunner chunked identity window for UART — design
 
-Status: accepted, 2026-09-12. The design is settled; nothing implements it
-yet. No firmware, host code, or normative protocol text has been changed for
-it — see "Still required" at the end.
+Status: accepted, 2026-09-12; implemented 2026-09-13 (Stage 2 of
+`roadrunner-identity-implementation-plan.md`). The chunk registers are now in
+the normative table in `roadrunner-usb-admin-protocol.md`. The Problem section
+below describes the state before that change.
 Supersedes nothing; extends `roadrunner-usb-admin-protocol.md`, which remains
 authoritative for the identity namespace and the register window, and
 `roadrunner-identity-gate-design.md`, which remains authoritative for what a
@@ -23,7 +24,7 @@ Roadrunner protocol — it is Klipper's MCU-side buffer.
    `shutdown("tmcuart data too large")`, which takes the printer down
    mid-print. The host cannot try a long read and recover.
 
-So four bytes is a hard per-register ceiling on this transport. SERIAL (34),
+So four bytes is a hard per-register ceiling on this transport. SERIAL (32),
 FIRMWARE_VERSION (32) and IMAGE_RANGE (8) are all out of reach in one
 transaction, and the extra currently reports them as `None` rather than
 attempting them. IMAGE_DIGEST (4) is exactly at the ceiling and is the one
@@ -121,7 +122,8 @@ has no chunk base, the existing four-byte guard still fires and returns
 `None`. This keeps chunking entirely inside the transport: `read_identity`
 and `read_firmware_image` in `RegisterReaderGeneric` are untouched, and
 `RegisterReaderUART.identity_registers` / `image_registers` go back to the
-full tuples.
+full tuples. (As built, `RegisterReaderUART` wraps both reads only to set the
+per-attempt budget described under Pacing.)
 
 **Retries stay per chunk**, never per field. One flaky slice must not restart
 the other seven.
@@ -140,7 +142,7 @@ unlike SERIAL, where every byte of the encoded UUID is significant.
 | Field | Chunks allocated | Typical chunks read |
 |---|---|---|
 | SERIAL, provisioned (29 chars) | 8 | 8 |
-| SERIAL, unprovisioned (16 chars) | 8 | 4 |
+| SERIAL, unprovisioned (16 chars) | 8 | 5 |
 | FIRMWARE_VERSION, `dev` | 8 | 1 |
 | FIRMWARE_VERSION, `v0.3.1-12-gab34cd7` | 8 | 5 |
 | IMAGE_RANGE | 2 | 2 |
@@ -151,13 +153,21 @@ the same trap the protocol doc already names for the digest, where a zero CRC
 is a real CRC and "no digest" had to be signalled some other way. Both chunks
 are always read in full.
 
-**Pacing.** A full identity read is 18 chunk transactions worst case, and 7-14
-typical with early stop — 7 for the unprovisioned board that the provisioning
-flow most needs to read quickly, each with up to 5 retries. They must not all land in one sensor-poll callback. The reader
-carries a per-attempt budget measured in chunks, keeps successfully-read
-chunks in an accumulator between attempts, and completes the field across
-several polls. `_update_identity` already has a retry timer and caches, so
-this is a bounded amount of new state.
+**Pacing.** A full identity read is 18 chunk transactions worst case, and 8-15
+typical with early stop — 8 for the unprovisioned board that the provisioning
+flow most needs to read quickly, each with up to 5 retries. They must not all
+land in one sensor-poll callback. The reader carries a per-attempt budget
+measured in chunks, keeps successfully-read chunks in an accumulator between
+attempts, and completes the field across several polls. `_update_identity`
+already has a retry timer and caches, so this is a bounded amount of new state.
+
+As built: the budget is six chunks per attempt, and the identity and image
+reads each get their own. A read that spends its budget returns a pending
+marker, and `_update_identity` tries again on the next poll instead of waiting
+out the retry timer. A field whose chunk fails after its retries is recorded as
+failed for the rest of that read, so later attempts report it `None` instead of
+spending their budget on it again. The accumulator empties when a read
+completes.
 
 **The accumulator clears on `_sensor_connected_changed`**, alongside
 `_identity` and `_firmware_image`.
@@ -242,7 +252,9 @@ Nothing real is lost by removing it:
   travelling the sensor bus at all — which retires the exposure discussed under
   "No FLASH_UID chunks" rather than managing it.
 
-`RR-UNPROVISIONED` is 16 characters, exactly four chunks with no padding:
+`RR-UNPROVISIONED` is 16 characters, exactly four chunks with no padding. Its
+NUL terminator is therefore the first byte of chunk 4, so a host that stops at
+the first NUL reads five chunks, not four:
 
 | Chunk | Register | Bytes |
 |---|---|---|
@@ -250,13 +262,14 @@ Nothing real is lost by removing it:
 | 1 | `0x38` | `NPRO` |
 | 2 | `0x39` | `VISI` |
 | 3 | `0x3A` | `ONED` |
+| 4 | `0x3B` | `\0\0\0\0` |
 
 The widest serial becomes the provisioned form at 29 characters, so:
 
 - `RR_USB_SERIAL_MAX_LENGTH` and `RR_REG_SERIAL_SIZE` drop from 34 to 32.
 - SERIAL takes 8 chunks, `0x37`–`0x3E`. `0x3F` is freed; the window's other
   allocations are unchanged.
-- An unprovisioned board costs 4 chunk reads with early stop, not 9.
+- An unprovisioned board costs 5 chunk reads with early stop, not 9.
 
 **Rejected: a sentinel value** such as all-`0xFF` or all-zero in place of the
 text. `0xFF` is already the gate's filler for a refused register, so a sentinel
@@ -327,9 +340,8 @@ serial already requires.
 
 ## Prose this retracts
 
-Four passages currently explain why these fields cannot exist over UART. All
-four become wrong the moment this is implemented, and must be updated in the
-same change:
+Retracted in the implementing change. Four passages explained why these fields
+could not exist over UART:
 
 - `klippy/extras/high_resolution_filament_sensor.py`, the `RegisterReaderUART`
   class comment — "SERIAL (34) and FIRMWARE_VERSION (32) ... are reported as
@@ -341,14 +353,11 @@ same change:
 - `README.md`, "Over UART the digest is present but `start` and `length` are
   `null`".
 
-The normative register table in `roadrunner-usb-admin-protocol.md` is
-deliberately left alone until firmware exists; the table above is written to be
-lifted into it at that point.
+The table above has been lifted into the normative register table in
+`roadrunner-usb-admin-protocol.md`.
 
 ## Still required
 
-- Firmware: chunk dispatch in `rr_identity_registers_read()`, driven from the
-  existing wide-register buffers so there is one source of each field.
-- Host: the `read_reg` override, the accumulator, and the per-attempt budget.
 - Bench: a UART-wired board reporting a serial that matches what the same board
-  reports over USB, byte for byte.
+  reports over USB, byte for byte. Tracked in
+  `roadrunner-identity-implementation-plan.md`, Stage 2.

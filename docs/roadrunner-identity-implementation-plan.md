@@ -147,7 +147,19 @@ Makes a UART board identifiable at all. This is the stage the README TODO names.
   `None` rather than a truncated string.
 - Bench, required: a UART board reporting a full `identity.serial`. Also
   measure the first-read cost against the poll interval — 18 transactions worst
-  case, 7–14 typical.
+  case, 8–15 typical.
+
+**As built.** `CHUNK_BASES` lives on `RegisterReaderUART`, not the generic
+reader, since no other transport needs it. Locked boards answer every chunk,
+the same as the wide registers. `RegisterReaderUART` gives the identity read and
+the image read a budget of six chunks each per attempt. A read that runs out
+returns `READ_PENDING`, and `_update_identity` carries on at the next poll
+rather than the retry timer. A chunk that still fails after its five retries
+makes that field `None` for the rest of the read, so a board with one bad chunk
+still converges. The not-provisioned message now fires once, when the identity
+is first read, instead of on every attempt at the image registers. The
+unprovisioned serial takes five chunks, not the four the read design first
+said, because its NUL is chunk 4.
 
 ## Stage 3 — boot marker at `0x25`
 

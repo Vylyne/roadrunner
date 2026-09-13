@@ -203,19 +203,197 @@ def test_uart_never_asks_for_a_register_that_would_shut_down_the_mcu(monkeypatch
     reader = module.RegisterReaderUART(uart)
 
     with caplog.at_level(logging.WARNING):
-        reg = module.IdentityRegister
-        assert reader.read_reg(reg.SERIAL, reg.SIZES[reg.SERIAL]) is None
+        # 0x34 READ_FLASH_UID is eight bytes and has no chunk run.
+        assert reader.read_reg(0x34, 8) is None
 
     assert uart.reads == []
     assert any("tmcuart buffer" in message for message in caplog.messages)
 
+
+# docs/roadrunner-uart-chunked-identity-design.md, "Register allocation". The
+# firmware pins the same numbers in rp2040/tests/test_identity_registers.c.
+CHUNK_BASES = {0x31: 0x37, 0x32: 0x40, 0x36: 0x48}
+
+
+class ChunkedUart:
+    """A tmcuart that answers the way the firmware does: four bytes a register,
+    with the wide fields served as stateless chunks."""
+
+    def __init__(self, module, payloads, fail=()):
+        self.registers = {}
+        for reg, data in payloads.items():
+            if len(data) <= 4:
+                self.registers[reg] = bytes(data)
+            if reg in CHUNK_BASES:
+                for index in range(len(data) // 4):
+                    self.registers[CHUNK_BASES[reg] + index] = \
+                        bytes(data[index * 4:index * 4 + 4])
+        self.fail = set(fail)
+        self.reads = []
+
+    def reg_read(self, _instance_id, addr, reg, reg_length=4):
+        self.reads.append((reg, reg_length))
+        assert reg_length <= 4, "an over-long tmcuart read shuts the MCU down"
+        if reg in self.fail or reg not in self.registers:
+            return None
+        return bytearray(self.registers[reg][:reg_length])
+
+
+def _uart_reader(module, payloads, fail=(), budget=None):
+    uart = ChunkedUart(module, payloads, fail)
+    reader = module.RegisterReaderUART(uart)
+    if budget is not None:
+        reader.CHUNKS_PER_ATTEMPT = budget
+    return reader, uart
+
+
+def _chunk_reads(uart, base, count):
+    return [reg for reg, _ in uart.reads if base <= reg < base + count]
+
+
+def test_uart_reassembles_the_serial_and_version_from_chunks(monkeypatch):
+    module = _load_extra(monkeypatch)
+    serial = b"RR-7HZHY879879X19ZQZTJYQ7DDRB"
+    reader, uart = _uart_reader(
+        module, _identity_payloads(module, serial=serial), budget=100)
+
     identity = reader.read_identity()
-    assert [reg for reg, _ in uart.reads] == [
-        module.IdentityRegister.STATE,
-        module.IdentityRegister.VARIANT,
-    ]
+
+    assert identity.serial == serial.decode()
+    assert identity.firmware_version == "v1.2.3"
+    assert identity.get_status()["transport"] == "usb"
+    # The 29-character serial needs all eight chunks; "v1.2.3" plus its
+    # terminator needs two.
+    assert _chunk_reads(uart, 0x37, 8) == list(range(0x37, 0x3f))
+    assert _chunk_reads(uart, 0x40, 8) == [0x40, 0x41]
+
+
+def test_uart_stops_at_the_chunk_holding_the_terminator(monkeypatch):
+    """RR-UNPROVISIONED is sixteen characters, so its NUL is in chunk 4."""
+    module = _load_extra(monkeypatch)
+    reader, uart = _uart_reader(
+        module, _identity_payloads(module, state=0, serial=b"RR-UNPROVISIONED"),
+        budget=100)
+
+    assert reader.read_identity().serial == "RR-UNPROVISIONED"
+    assert _chunk_reads(uart, 0x37, 8) == [0x37, 0x38, 0x39, 0x3a, 0x3b]
+
+
+def test_uart_reads_the_image_range_in_full_even_with_zero_bytes(monkeypatch):
+    """The range is binary: a zero start is a value, not a terminator."""
+    module = _load_extra(monkeypatch)
+    reader, uart = _uart_reader(
+        module, _identity_payloads(module, image_start=0, image_length=600),
+        budget=100)
+
+    image = reader.read_firmware_image()
+
+    assert image.digest == 0xBBE38AA9
+    assert (image.start, image.length) == (0, 600)
+    assert _chunk_reads(uart, 0x48, 2) == [0x48, 0x49]
+
+
+def test_uart_loses_a_field_whose_chunk_fails_but_keeps_the_rest(monkeypatch):
+    """Never a truncated serial - and never the state thrown away for it."""
+    module = _load_extra(monkeypatch)
+    serial = b"RR-7HZHY879879X19ZQZTJYQ7DDRB"
+    reader, uart = _uart_reader(
+        module, _identity_payloads(module, serial=serial), fail={0x3a},
+        budget=100)
+
+    identity = reader.read_identity()
+
     assert identity.serial is None
-    assert identity.firmware_version is None
+    assert identity.firmware_version == "v1.2.3"
+    assert identity.provisioned
+    # Nothing past the failed chunk is asked for.
+    assert not [reg for reg in _chunk_reads(uart, 0x37, 8) if reg > 0x3a]
+
+
+def test_uart_spreads_the_identity_over_polls_and_converges(monkeypatch):
+    module = _load_extra(monkeypatch)
+    serial = b"RR-7HZHY879879X19ZQZTJYQ7DDRB"
+    reader, uart = _uart_reader(module, _identity_payloads(module, serial=serial))
+    sensor = _bare_sensor(module, reader)
+    assert module.RegisterReaderUART.CHUNKS_PER_ATTEMPT == 6
+
+    for tick in range(20):
+        sensor._update_identity(tick * 0.1)
+        if sensor._identity is not None and sensor._firmware_image is not None:
+            break
+
+    assert sensor._identity.serial == serial.decode()
+    assert sensor._identity.firmware_version == "v1.2.3"
+    assert (sensor._firmware_image.start, sensor._firmware_image.length) == \
+        (0x10000000, 600)
+    # Ten identity chunks and two range chunks, each read exactly once.
+    chunks = [reg for reg, _ in uart.reads if 0x37 <= reg <= 0x49]
+    assert sorted(chunks) == sorted(set(chunks))
+    assert len(chunks) == 12
+    # Six identity chunks on the first poll; the last four on the second, and
+    # the image read gets its own budget on that same poll.
+    assert tick == 1
+    assert reader._chunks == {}
+
+
+def test_a_failed_chunk_is_not_retried_by_every_pending_attempt(monkeypatch):
+    """Otherwise a board that always fails one chunk never finishes the rest."""
+    module = _load_extra(monkeypatch)
+    serial = b"RR-7HZHY879879X19ZQZTJYQ7DDRB"
+    reader, uart = _uart_reader(
+        module, _identity_payloads(module, serial=serial), fail={0x3b}, budget=3)
+    sensor = _bare_sensor(module, reader)
+
+    for tick in range(20):
+        sensor._update_identity(tick * 0.1)
+        if sensor._identity is not None:
+            break
+
+    assert sensor._identity.serial is None
+    assert sensor._identity.firmware_version == "v1.2.3"
+    assert uart.reads.count((0x3b, 4)) == 5  # one read, its own retries
+
+
+def test_a_pending_read_waits_for_the_next_poll_not_the_retry_timer(monkeypatch):
+    module = _load_extra(monkeypatch)
+    reader, uart = _uart_reader(module, _identity_payloads(module), budget=1)
+    sensor = _bare_sensor(module, reader)
+
+    sensor._update_identity(0.)
+    assert sensor._identity is None
+    reads = len(uart.reads)
+
+    sensor._update_identity(0.1)
+    assert len(uart.reads) > reads
+
+
+def test_an_unprovisioned_board_is_reported_once_across_pending_polls(monkeypatch):
+    module = _load_extra(monkeypatch)
+    reader, uart = _uart_reader(
+        module, _identity_payloads(module, state=0), budget=1)
+    sensor = _bare_sensor(module, reader)
+
+    for tick in range(40):
+        sensor._update_identity(tick * 0.1)
+
+    assert sensor._firmware_image is not None
+    assert len(sensor.errors) == 1
+    assert "not provisioned" in sensor.errors[0]
+
+
+def test_a_reconnect_drops_half_read_chunks(monkeypatch):
+    """The board that came back may carry a different serial."""
+    module = _load_extra(monkeypatch)
+    reader, uart = _uart_reader(module, _identity_payloads(module), budget=1)
+    sensor = _bare_sensor(module, reader)
+    sensor._respond_info = lambda msg, log=False: None
+
+    assert reader.read_identity() is module.READ_PENDING
+    assert reader._chunks
+
+    sensor._sensor_connected_changed(False, True, 0.)
+
+    assert reader._chunks == {}
 
 
 def test_serial_reader_frames_a_register_longer_than_read_all(monkeypatch):
@@ -467,30 +645,19 @@ def test_an_unreadable_range_keeps_the_digest_it_did_read(monkeypatch):
     assert image.length is None
 
 
-def test_uart_reads_the_digest_but_never_the_range(monkeypatch):
-    """Four bytes fit the tmcuart buffer; the eight-byte range register does not.
-
-    Asking for the range over UART is not a failed read - it is
-    shutdown("tmcuart data too large"), which takes the printer down.
-    """
+def test_uart_reads_the_range_through_its_chunks_never_whole(monkeypatch):
+    """Asking for the eight-byte range register over UART is not a failed
+    read - it is shutdown("tmcuart data too large"), which takes the printer
+    down. ChunkedUart asserts on any such read."""
     module = _load_extra(monkeypatch)
+    reader, uart = _uart_reader(module, _identity_payloads(module))
 
-    class Uart:
-        def __init__(self):
-            self.reads = []
-
-        def reg_read(self, _instance_id, addr, reg, reg_length=4):
-            self.reads.append((reg, reg_length))
-            return struct.pack("<L", 0xBBE38AA9)
-
-    uart = Uart()
-    reader = module.RegisterReaderUART(uart)
     image = reader.read_firmware_image()
 
-    assert [reg for reg, _ in uart.reads] == [module.IdentityRegister.IMAGE_DIGEST]
+    assert [reg for reg, _ in uart.reads] == [
+        module.IdentityRegister.IMAGE_DIGEST, 0x48, 0x49]
     assert image.digest == 0xBBE38AA9
-    assert image.start is None
-    assert image.length is None
+    assert (image.start, image.length) == (0x10000000, 600)
     assert all(length <= module.RegisterReaderUART.MAX_REGISTER_LENGTH
                for _, length in uart.reads)
 
@@ -525,6 +692,7 @@ def test_a_reconnect_drops_the_cached_digest_with_the_identity(monkeypatch):
     sensor = _bare_sensor(module, reader)
     sensor.infos = []
     sensor._respond_info = lambda msg, log=False: sensor.infos.append(msg)
+    reader.discard_partial_reads = lambda: None
     sensor._update_identity(0.)
     assert sensor._firmware_image is not None
 
