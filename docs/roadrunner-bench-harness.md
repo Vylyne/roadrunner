@@ -5,7 +5,8 @@ real hardware without touching a printer. `AGENTS.md` requires this: connected
 printer hardware is production hardware, and a toolhead or installed sensor is
 never a test target.
 
-Status: planned. Not yet built.
+Status: built and running, 2026-09-13. Klipper host is a Raspberry Pi rather
+than WSL2. I2C bring-up passed on the first attempt; UART not yet exercised.
 
 ## Shape
 
@@ -42,7 +43,7 @@ master firmware.
 | --- | --- | --- |
 | 2 | RP2040-Zero | DUT and master |
 | 4 | 330 Ω | series protection on each signal line |
-| 2 | 4.7 kΩ | I2C pull-ups (2.2 kΩ works; see the margin note) |
+| 3 | 4.7 kΩ | two I2C pull-ups (2.2 kΩ works; see the margin note), one thermistor pull-up |
 | 1 | 100 kΩ | fake thermistor on the master |
 | — | wire | including an explicit ground strap |
 
@@ -60,7 +61,7 @@ both transports with no rewiring.
 | GP9 | 330 Ω | GP4 | UART: master RX ← DUT TX |
 | GP8 | 330 Ω | GP5 | UART: master TX → DUT RX |
 | GND | — | GND | required, see below |
-| GP26 | 100 kΩ to GND | — | fake thermistor |
+| GP26 | 4.7 kΩ to 3V3 **and** 100 kΩ to GND | — | fake thermistor |
 
 Both boards take power from their own USB connection to the host. **Run an
 explicit ground strap anyway** — grounding only through two USB cables and the
@@ -180,9 +181,17 @@ GPIOs satisfy it with nothing soldered. `heater_pin` is just a PWM output.
 talk to a real driver over UART and fail at startup when nothing answers.
 
 **The thermistor is the only part that must be real**, because it is the only
-input Klipper actually reads — an out-of-range ADC is a startup fault. 100 kΩ
-from `gpio26` to GND with the default `pullup_resistor: 4700` reads about 25 °C
-under `Generic 3950`, comfortably inside `min_temp`/`max_temp`.
+input Klipper actually reads — an out-of-range ADC is a startup fault.
+
+It takes **two** resistors: 4.7 kΩ from `gpio26` to 3V3, and 100 kΩ from `gpio26`
+to GND. `pullup_resistor: 4700` is not a resistor Klipper provides — it is the
+value Klipper *assumes* a printer board has fitted, used only in the conversion
+math. A bare RP2040-Zero has no such pull-up. With the 100 kΩ alone the ADC pin
+is barely driven, and on the first build of this rig it read a wandering
+171–177 °C instead of 25 °C. That stays inside `min_temp`/`max_temp` so nothing
+faults — which is the trap: it drifts, and a drift past either limit shuts the
+bench down mid-test for a reason unrelated to the sensor. With both resistors
+fitted the divider reads about 25 °C under `Generic 3950`.
 
 ### I2C
 
