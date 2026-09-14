@@ -372,7 +372,28 @@ forever. The host computes the CRC over the UUID it intends, so a splice fails.
 - An I2C write that fails at the bus fails provisioning at once rather than
   waiting out the timeout.
 
-**Bench** — not yet run.
+**Bench, UART DUT, 2026-09-13** — firmware `0defa59` (`roadrunner_v1_uart_rgb`)
+
+- The build directory's `ROADRUNNER_FIRMWARE_VERSION` was a stale cache value
+  (`da5b6c1`), so the first flash reported the old version; rebuilt with
+  `-DROADRUNNER_FIRMWARE_VERSION=0defa59` and reflashed so the running image is
+  identifiable.
+- `roadrunner_admin.py clear` left the board `RR-UNPROVISIONED`, identity
+  `NONE`. Klipper restarted with `auto_provision` at its default.
+- The first identity read after ready logged `provisioning it as
+  RR-6CWMKS36PQ9V9RN2ZW9B8901N1`; the board rebooted, 47 UART read errors were
+  logged while it was away, then `provisioned as
+  RR-6CWMKS36PQ9V9RN2ZW9B8901N1`, and `sensor_connected` went false to true.
+  The status object reported that serial with `state: ok`, and USB enumerated
+  as `usb-Vylyne_Roadrunner_RR-6CWMKS36PQ9V9RN2ZW9B8901N1-if00`, so the
+  identity written over UART is the one the board serves on USB too.
+- No UART errors in steady state afterwards; `resets` stayed 0, because the
+  boot marker is not asked of a board until its identity has answered.
+- A second Klipper restart read the provisioned board and connected with no
+  provisioning, no UART errors and `reads_failed` 0.
+- Not exercised on hardware: I2C, the `serial:` admin path, and every failure
+  path (refused commit, wrong serial, board never returns). Those rest on the
+  host tests.
 
 ## Carried over, not part of this plan
 
