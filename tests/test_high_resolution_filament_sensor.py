@@ -74,6 +74,9 @@ def test_i2c_read_failure_names_sensor_mcu_and_bus(monkeypatch, caplog):
         def get_printer(self):
             return Printer()
 
+        def register_config_callback(self, _callback):
+            pass
+
     class FailingI2C:
         bus = "i2c1"
 
@@ -1081,7 +1084,9 @@ def test_i2c_stages_four_chunks_then_commits(monkeypatch):
 
         def get_mcu(self):
             printer = types.SimpleNamespace(command_error=RuntimeError)
-            return types.SimpleNamespace(get_printer=lambda: printer)
+            return types.SimpleNamespace(
+                get_printer=lambda: printer,
+                register_config_callback=lambda _callback: None)
 
         def i2c_write(self, data):
             self.writes.append(list(data))
@@ -1096,6 +1101,105 @@ def test_i2c_stages_four_chunks_then_commits(monkeypatch):
         [0x53, 0x0c, 0x0d, 0x0e, 0x0f],
         [0x54, 0x00, 0x00, 0x00, 0x41],
     ]
+
+
+class RebootingI2C:
+    """An MCU_I2C whose MCU has i2c_transfer, and a board mid-reboot: bus.py's
+    own read would shut the printer down, so the test fails if it is used."""
+
+    I2C_READ = "i2c_read oid=%c reg=%*s read_len=%u"
+
+    def __init__(self, module, commands=("i2c_transfer",)):
+        self.module = module
+        self.commands = commands
+        self.callbacks = []
+        self.status = "BUS_TIMEOUT"
+        self.bus_py_reads = []
+        self.transfers = []
+        printer = types.SimpleNamespace(command_error=RuntimeError)
+        self.mcu = types.SimpleNamespace(
+            get_printer=lambda: printer,
+            get_name=lambda: "mcu",
+            register_config_callback=self.callbacks.append,
+            try_lookup_command=self._try_lookup,
+            lookup_query_command=self._lookup_query)
+        self.bus = "i2c0b"
+
+    def _try_lookup(self, msgformat):
+        return msgformat if msgformat.split()[0] in self.commands else None
+
+    def _lookup_query(self, msgformat, respformat, oid=None, cq=None):
+        assert msgformat.startswith("i2c_transfer ")
+        assert respformat.startswith("i2c_response ")
+        assert (oid, cq) == (7, "queue")
+        return types.SimpleNamespace(send=self._transfer)
+
+    def _transfer(self, params):
+        self.transfers.append(params)
+        return {"i2c_bus_status": self.status, "response": b"\x01\x02"}
+
+    def get_mcu(self):
+        return self.mcu
+
+    def get_oid(self):
+        return 7
+
+    def get_command_queue(self):
+        return "queue"
+
+    def i2c_read(self, write, read_len):
+        self.bus_py_reads.append((write, read_len))
+        return {"response": b"\x03\x04"}
+
+    def configure(self, reader):
+        assert self.callbacks == [reader._build_config]
+        for callback in self.callbacks:
+            callback()
+
+
+def test_i2c_reads_during_the_reboot_report_a_bus_error_as_no_answer(monkeypatch):
+    module = _load_extra(monkeypatch)
+    i2c = RebootingI2C(module)
+    reader = module.RegisterReaderI2C(i2c, "roadrunner")
+    i2c.configure(reader)
+
+    assert reader.i2c_read_reg(0x10, 2) == bytearray(b"\x03\x04")
+    assert i2c.transfers == []
+
+    reader.expect_reboot(True)
+    assert reader.i2c_read_reg(0x10, 2) is None
+    i2c.status = "SUCCESS"
+    assert reader.i2c_read_reg(0x10, 2) == bytearray(b"\x01\x02")
+    assert i2c.transfers == [[7, [0x10], 2], [7, [0x10], 2]]
+    assert len(i2c.bus_py_reads) == 1
+
+    reader.expect_reboot(False)
+    assert reader.i2c_read_reg(0x10, 2) == bytearray(b"\x03\x04")
+    assert len(i2c.transfers) == 2
+
+
+def test_i2c_mcu_code_without_i2c_transfer_keeps_bus_py_reads(monkeypatch):
+    """Old MCU code fails a bad read on the MCU itself; there is nothing to
+    route around, so the reader does not pretend otherwise."""
+    module = _load_extra(monkeypatch)
+    i2c = RebootingI2C(module, commands=("i2c_read", "i2c_transfer"))
+    reader = module.RegisterReaderI2C(i2c, "roadrunner")
+    i2c.configure(reader)
+
+    reader.expect_reboot(True)
+    assert reader.i2c_read_reg(0x10, 2) == bytearray(b"\x03\x04")
+    assert i2c.transfers == []
+
+
+def test_an_i2c_read_after_bus_py_shut_down_returns_nothing(monkeypatch):
+    """bus.py returns None once it has invoked the shutdown; that must not
+    turn into an unhandled TypeError in the poll timer."""
+    module = _load_extra(monkeypatch)
+    i2c = RebootingI2C(module)
+    i2c.i2c_read = lambda write, read_len: None
+    reader = module.RegisterReaderI2C(i2c, "roadrunner")
+
+    assert reader.i2c_read_reg(0x10, 2) is None
 
 
 def test_uart_sends_the_same_bytes_most_significant_first(monkeypatch):
@@ -1153,6 +1257,7 @@ class ProvisioningBoard:
         self.serial = b"RR-UNPROVISIONED"
         self.offline = 0
         self.provisioned_with = []
+        self.reboot_expected = []
         self.identity_registers = module.RegisterReaderGeneric.identity_registers
         self.image_registers = module.RegisterReaderGeneric.image_registers
 
@@ -1164,6 +1269,9 @@ class ProvisioningBoard:
 
     def discard_partial_reads(self):
         pass
+
+    def expect_reboot(self, rebooting):
+        self.reboot_expected.append(rebooting)
 
     def provision(self, uuid_bytes):
         self.provisioned_with.append(bytes(uuid_bytes))
@@ -1221,6 +1329,7 @@ def test_a_locked_bus_board_is_provisioned_and_confirmed_by_its_serial(monkeypat
 
     sensor._update_state_from_sensor()
     assert board.provisioned_with == [COUNTING_UUID]
+    assert board.reboot_expected == [True]
     assert not sensor._sensor_connected
 
     _poll_for(sensor, 1.)
@@ -1231,6 +1340,7 @@ def test_a_locked_bus_board_is_provisioned_and_confirmed_by_its_serial(monkeypat
     assert sensor.shutdowns == []
     assert sensor._identity.serial == COUNTING_SERIAL
     assert sensor._sensor_connected
+    assert board.reboot_expected == [True, False]
     assert any(f"provisioned as {COUNTING_SERIAL}" in m for m in sensor.infos)
     assert not any("not provisioned (identity" in m for m in sensor.errors)
 
@@ -1319,6 +1429,7 @@ def test_a_board_that_never_returns_stops_the_printer(monkeypatch):
 
     assert len(sensor.shutdowns) == 1
     assert "did not answer" in sensor.shutdowns[0]
+    assert board.reboot_expected == [True, False]
 
 
 class AdminPort:

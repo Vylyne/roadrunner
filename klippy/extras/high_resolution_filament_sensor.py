@@ -433,6 +433,12 @@ class RegisterReaderGeneric:
         return self.write_reg(ProvisionRegister.COMMIT,
                               bytes([0, 0, 0, crc8_atm(uuid_bytes)]))
 
+    def expect_reboot(self, rebooting : bool):
+        """ Told True once a commit has been sent and False when provisioning
+        settles either way. Only a transport on which a vanished board is
+        fatal needs to act on it. """
+        pass
+
     def discard_partial_reads(self):
         """ Forget any half-assembled identity field. Called when the board
         reconnects, since the board that came back may not be the one that
@@ -673,10 +679,35 @@ class RegisterReaderUART(RegisterReaderGeneric):
 class RegisterReaderI2C(RegisterReaderGeneric):
     bus_provisioning = True
 
+    I2C_READ = "i2c_read oid=%c reg=%*s read_len=%u"
+    I2C_TRANSFER = "i2c_transfer oid=%c write=%*s read_len=%u"
+    I2C_RESPONSE = "i2c_response oid=%c i2c_bus_status=%c response=%*s"
+
     def __init__(self, i2c, sensor_name):
         self.i2c = i2c
         self.printer = i2c.get_mcu().get_printer()
         self.sensor_name = sensor_name
+        self._rebooting = False
+        self._transfer_cmd = None
+        i2c.get_mcu().register_config_callback(self._build_config)
+
+    def _build_config(self):
+        # bus.py shuts the printer down on any bus error, which is right for a
+        # board that vanishes mid-print and wrong for one that is rebooting
+        # because it was just told to. A second query on the same command lets
+        # reads during that reboot see the bus status for themselves. MCU code
+        # old enough to have i2c_read fails such a read on the MCU instead,
+        # and nothing on the host can get around that.
+        mcu = self.i2c.get_mcu()
+        if mcu.try_lookup_command(self.I2C_READ) is not None \
+                or mcu.try_lookup_command(self.I2C_TRANSFER) is None:
+            return
+        self._transfer_cmd = mcu.lookup_query_command(
+            self.I2C_TRANSFER, self.I2C_RESPONSE, oid=self.i2c.get_oid(),
+            cq=self.i2c.get_command_queue())
+
+    def expect_reboot(self, rebooting):
+        self._rebooting = rebooting
 
     def read(self):
         return self.decode_all(self.i2c_read_reg(SensorRegister.ALL, 10))
@@ -699,8 +730,13 @@ class RegisterReaderI2C(RegisterReaderGeneric):
             return False
 
     def i2c_read_reg(self, reg, length):
+        if self._rebooting and self._transfer_cmd is not None:
+            return self._read_while_rebooting(reg, length)
         try:
             params = self.i2c.i2c_read([reg], length)
+            if params is None:
+                # bus.py has already shut the printer down over a bus error.
+                return
             return bytearray(params['response'])
         except (serialhdl.error, self.printer.command_error) as e:
             mcu_name = self.i2c.get_mcu().get_name()
@@ -710,6 +746,23 @@ class RegisterReaderI2C(RegisterReaderGeneric):
                 f"(MCU '{mcu_name}', bus '{bus_name}'): {e}"
             )
             return
+
+    def _read_while_rebooting(self, reg, length):
+        """ A read that reports a bus error as no answer instead of a
+        shutdown. Used only between sending a commit and provisioning
+        settling, when the board is expected to drop off the bus. """
+        try:
+            params = self._transfer_cmd.send([self.i2c.get_oid(), [reg], length])
+        except (serialhdl.error, self.printer.command_error) as e:
+            logging.warning(f"{self.sensor_name}: Unable to read via I2C "
+                            f"while the board reboots: {e}")
+            return
+        status = params["i2c_bus_status"]
+        if status != "SUCCESS":
+            logging.info(f"{self.sensor_name}: I2C read of register "
+                         f"{reg:02x} got {status}; the board is rebooting")
+            return
+        return bytearray(params["response"])
 
 class RegisterReaderSerial(RegisterReaderGeneric):
     def __init__(self, serial : serial.Serial):
@@ -1593,6 +1646,7 @@ class HighResolutionFilamentSensor:
 
         self._provision_expected = expected
         self._provision_deadline = eventtime + PROVISION_TIMEOUT
+        self.regs.expect_reboot(True)
         self._identity = None
         self._identity_next_attempt = eventtime + PROVISION_REREAD_INTERVAL
         self.regs.discard_partial_reads()
@@ -1607,6 +1661,7 @@ class HighResolutionFilamentSensor:
         expected = self._provision_expected
         if identity.provisioned and identity.serial == expected:
             self._provision_expected = None
+            self.regs.expect_reboot(False)
             self._respond_info(f"provisioned as {expected}", log=True)
             return True
         if identity.provisioned and identity.serial is not None:
@@ -1629,6 +1684,7 @@ class HighResolutionFilamentSensor:
 
     def _provision_failed(self, reason):
         self._provision_expected = None
+        self.regs.expect_reboot(False)
         msg = (f"{self.name}: auto_provision failed: the board {reason}. "
                f"Provision it with scripts/roadrunner_admin.py over USB, or set "
                f"auto_provision: False.")
