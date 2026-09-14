@@ -253,7 +253,9 @@ fixes the brownout discontinuity whether or not stage 4 ships.
   the log shows the reset at 1192 ms since boot and the rebase, and position
   was unchanged at -1.3314 before and after. The 102 read failures were the
   board being away while it rebooted.
-- Power cycle: not yet run.
+- Power cycle (DUT unplugged and replugged mid-session): logged as a
+  disconnect, then a reset at 1167 ms since boot and the rebase. `resets` went
+  1 to 2 and position was still -1.3314, so no phantom distance was recorded.
 
 ## Stage 4 — provisioning
 
