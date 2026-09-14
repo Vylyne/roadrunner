@@ -1,6 +1,9 @@
 # Provisioning over the sensor bus
 
-Status: proposed, 2026-09-12. Nothing implements this yet. It depends on
+Status: implemented, 2026-09-13, as Stage 4 of
+[roadrunner-identity-implementation-plan.md](roadrunner-identity-implementation-plan.md),
+with two deviations from the firmware rules below, marked where they occur;
+the plan's Stage 4 "As built" has the rest. Proposed 2026-09-12. It depends on
 [roadrunner-uart-chunked-identity-design.md](roadrunner-uart-chunked-identity-design.md)
 for the read half — a host cannot decide whether to provision a board until it
 can read `SERIAL` on the transport it is already using.
@@ -79,6 +82,9 @@ Firmware rules:
 
 1. A write to any of these registers while unlocked is refused: NACK on I2C,
    silently dropped on UART (which has no reply channel to refuse on).
+   **As built:** dropped silently on I2C too. The pico-sdk slave handler has
+   already ACKed each byte by the time the write is complete at Stop, and the
+   host's re-read of the identity is the acknowledgement either way.
 2. Staged bytes live in RAM. They are zeroed at boot, and cleared after every
    commit attempt whether it succeeded or failed.
 3. A four-bit present-mask records which chunks have arrived. `COMMIT` refuses
@@ -90,6 +96,11 @@ Firmware rules:
 6. On success the board writes the identity record and reboots through
    `rr_usb_admin_acknowledge_before_application_reboot`, the same path the USB
    opcode takes.
+   **As built:** it reboots directly through
+   `rr_usb_admin_reboot_application(NULL)`. The acknowledge path waits for a
+   USB CDC reply to drain, and a sensor-bus commit has no USB requester to
+   drain to. The commit is applied from the main loop, never from the I2C or
+   UART handler, because it writes flash.
 
 ### Why the commit is checked
 

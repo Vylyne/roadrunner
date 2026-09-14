@@ -71,6 +71,9 @@ revisit it.
 - **Hazard 1 stops mattering for safety.** Colliding unprovisioned serials are
   still a discovery nuisance (see "Still required" below) but no longer a
   correctness risk, because none of the colliding boards is doing anything.
+  The sensor-bus provisioning path is not exposed to it at all: the klippy
+  extra addresses a board by the pin or bus address in its config, never by
+  serial, so two boards sharing `RR-UNPROVISIONED` cannot be confused on it.
 - **All four provisioning paths become safe by construction**, so they can
   coexist without each one needing its own carefully-reasoned guard.
 
@@ -81,7 +84,7 @@ revisit it.
 | mcu-updater, opt-in auto | mcu-updater users | USB admin |
 | mcu-updater, manual | mcu-updater users | USB admin |
 | `scripts/roadrunner_usb.py` (in mcu-updater) | USB wired, no mcu-updater | USB admin |
-| klippy extra, on connect | Klipper-only | usbserial only, until the write path lands |
+| klippy extra, on connect | Klipper-only | USB admin on `serial:`; staging registers on I2C and UART |
 
 The USB admin layer is present on all six builds ({I2C, UART, USB} × {RGB, GRB}),
 so the first three cover anyone with a USB cable attached.
@@ -95,6 +98,20 @@ UART-only installation needs a USB cable once**, until provisioning writes over
 those transports are built. The fourth path still earns its place — it is the
 route for a Klipper host with no mcu-updater — but not for the reason first
 given.
+
+**Update, 2026-09-13.** The write path has landed (Stage 4 of
+`roadrunner-identity-implementation-plan.md`, specced in
+`roadrunner-sensor-bus-provisioning-design.md`), and the fourth path now does
+serve I2C-only and UART-only installations with no USB cable.
+
+### The write rule
+
+Every register is read-only on every transport, except the provisioning
+staging registers `0x50`–`0x54`, which accept writes only while the board is
+locked. Locked and unprovisioned are the same state
+(`rr_identity_registers_locked()`), so a working board — the only kind that can
+be mid-print — ignores every write on the sensor bus, and the invariant above
+is what makes the write path safe rather than a guard written for it.
 
 ## Firmware design
 
@@ -287,6 +304,9 @@ On-connect provisioning, when enabled:
   `high_resolution_filament_sensor.py` itself. That module is vendored from
   `roadrunner-filament-sensor`; keeping the flash write outside it holds the
   vendor patch down to a few lines of read-and-report.
+  **Not as built:** Stage 4 put the write path in the module itself, because
+  it rides the register readers the module already defines. The vendor patch
+  is correspondingly larger.
 
 ### mcu-updater
 
@@ -339,13 +359,9 @@ not rediscovered:
 
 ## Still required, and explicitly not solved here
 
-- **Provisioning writes over I2C and UART.** The identity window is read-only in
-  this design, and `i2c_target.c` currently discards all writes ("we do not
-  support I2C writes"). Until a write path exists, the klippy extra can
-  provision over usbserial only, and an I2C-only or UART-only installation still
-  needs a USB cable once. This is deliberately deferred: the read window is the
-  harder decision and the easier build, and the write path benefits from the
-  register map already existing.
+- ~~**Provisioning writes over I2C and UART.**~~ Done, 2026-09-13: staging
+  registers `0x50`–`0x54`, writable only while locked. See "The write rule"
+  above.
 - **The `scripts/roadrunner_usb.py` gap.** It is stdlib-only at the top level
   and speaks the protocol directly, but "deliberately neither scans ports nor
   creates identities" — today it needs mcu-updater to hand it a port and a UUID.

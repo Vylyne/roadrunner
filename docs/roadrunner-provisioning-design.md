@@ -33,7 +33,11 @@ USB descriptors and INFO render the same serial. They build it in two places,
 ## Direct-USB protocol additions
 
 All maintenance traffic remains available only on Roadrunner's direct USB CDC
-port. The existing frame remains:
+port, with one exception: a locked board also accepts a UUID over I2C and UART,
+through staging registers `0x50`–`0x54` (see
+`roadrunner-sensor-bus-provisioning-design.md`). That is `PROVISION_UUID`'s
+effect by another route, not the admin protocol on another transport. The
+existing frame remains:
 
 ```c
 0x52 0x52 0x01 opcode payload_length payload crc8

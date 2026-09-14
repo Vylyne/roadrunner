@@ -329,6 +329,51 @@ forever. The host computes the CRC over the UUID it intends, so a splice fails.
 - Bench, required, and this is the stage that most needs it: a full round trip
   on each of I2C and UART with a second RP2040-Zero as bus master.
 
+**As built (`728978d` firmware, `b0aae51` Klippy)**
+
+- Refusal is silent on I2C as well as UART. The pico-sdk slave handler has
+  ACKed every byte before the write completes at Stop, so a NACK is not
+  available where the decision is made; the re-read is the acknowledgement on
+  both transports anyway.
+- The I2C target forwards a write at Stop with the first four data bytes and
+  the true length, so a write of the wrong length is ignored rather than
+  truncated into a valid one. The UART loop branches on the write bit before
+  the CRC byte, since a write datagram is eight bytes and a read four; writes
+  get no reply.
+- The commit is parked by the bus handler and applied from the main loop, with
+  interrupts disabled only around taking it, because it writes flash.
+- On success the board reboots through `rr_usb_admin_reboot_application(NULL)`,
+  not `rr_usb_admin_acknowledge_before_application_reboot`: there is no USB
+  requester, and waiting for CDC to drain could hang.
+- Staged bytes are kept in wire order, and the `COMMIT` CRC byte is the last
+  wire byte. Klipper's `tmc_uart` packs a register value MSB-first, so the UART
+  host sends each chunk as `int.from_bytes(chunk, 'big')` and both transports
+  carry identical bytes.
+- Two CRC-8s, not to be confused: the commit uses CRC-8/ATM, MSB-first, the
+  same as the USB admin frame (`"123456789"` → `0xF4`, UUID `00 01 … 0f` →
+  `0x41`); the UART datagram's own CRC is Trinamic's LSB-first one.
+- `0x50`–`0x54` are not in `scripts/roadrunner_admin.py`'s `REGISTERS`: `0x52`
+  collides with the register-read sync byte there, and the tool never writes.
+- The write path lives in `high_resolution_filament_sensor.py`, in the register
+  readers, against the identity gate design's note that it belongs in a
+  helper. `RegisterReaderGeneric.provision()` writes four chunks and the
+  commit; I2C and UART set `bus_provisioning`.
+- The failure "raise" at runtime is `printer.invoke_shutdown`, since it happens
+  in the poll timer after `klippy:ready`; the `serial:` path raises a real
+  config error from `klippy:connect`. The `serial:` error suggests the old
+  `serial:` path with the old serial replaced, or
+  `/dev/serial/by-id/usb-Vylyne_Roadrunner_<serial>-if00`.
+- Timing: the identity is re-read every 2 s while a commit is pending, and the
+  commit fails after 20 s. The `serial:` path waits 2 s for the admin reply.
+- A locked board is held disconnected (`_identity_locked`), and its identity
+  is re-read every 10 s, so one provisioned over USB mid-session is picked up.
+  A UART read that answers with the `0xff` refusal fill now counts as no
+  reading, so it no longer decodes as `full_turns = -1`.
+- An I2C write that fails at the bus fails provisioning at once rather than
+  waiting out the timeout.
+
+**Bench** — not yet run.
+
 ## Carried over, not part of this plan
 
 Outstanding from earlier work and unaffected by these stages:

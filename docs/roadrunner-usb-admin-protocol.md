@@ -272,11 +272,12 @@ rest is padding. It must always read both `READ_IMAGE_RANGE` chunks: the range
 is binary, and a zero byte there is a value. See
 `roadrunner-uart-chunked-identity-design.md`.
 
-**The identity register window is read-only in this release.** There is no
-write path on I2C or UART: `i2c_target.c` reads and discards every byte after
-the register address, and the UART transport is request/response only. A
-board with no USB cable attached can be read over I2C or UART, but it can
-only be provisioned over the direct USB admin protocol above.
+**The identity register window is read-only.** The only writable registers
+on I2C or UART are the provisioning staging registers `0x50`–`0x54`, and only
+while the board is locked; see
+`roadrunner-sensor-bus-provisioning-design.md`. A board with no USB cable
+attached can be provisioned through them, but every admin opcode, including
+`PROVISION_UUID` itself, is reachable only over USB.
 
 `READ_FIRMWARE_VERSION` (`0x32`) is 32 bytes **including** the NUL
 terminator, so it holds at most 31 characters of version string — one fewer

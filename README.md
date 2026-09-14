@@ -26,6 +26,9 @@
   transport, UART included
 - [x] A digest of the firmware image the board is actually running, so a host
   tool can tell a bad or mismatched flash write from a good one
+- [x] Klipper provisions an unprovisioned board on connect, over the sensor bus
+  it is already wired to (I2C or UART) or over USB serial — no USB cable or
+  workstation needed
 
 Provisioned USB serials use the `RR-<26 base32 UUID>` namespace. An ordinary
 UF2 update preserves the identity record; the direct-USB `CLEAR_IDENTITY`
@@ -42,21 +45,28 @@ inert; on I2C and UART it announces this with a short amber LED burst every
 provisioning is the confirmation it worked. If your Roadrunner "does not
 work" after flashing, provision it first.
 
-Every provisioning path is built on the same firmware primitive: the direct
-USB admin `PROVISION_UUID` opcode, which works today on all six firmware
-images (see [`docs/roadrunner-usb-admin-protocol.md`](docs/roadrunner-usb-admin-protocol.md)).
-There are four intended ways to reach it:
+A board can be provisioned two ways. Over USB, the direct admin
+`PROVISION_UUID` opcode works on all six firmware images (see
+[`docs/roadrunner-usb-admin-protocol.md`](docs/roadrunner-usb-admin-protocol.md)).
+Over I2C or UART, the board accepts a UUID written to staging registers
+`0x50`–`0x53` and a CRC-checked commit at `0x54`, and only while it is
+unprovisioned; a provisioned board ignores every write on the sensor bus (see
+[`docs/roadrunner-sensor-bus-provisioning-design.md`](docs/roadrunner-sensor-bus-provisioning-design.md)).
+The ways to reach them:
 
 - mcu-updater, opt-in automatic provisioning
 - mcu-updater, manual provisioning
 - a standalone USB provisioning script (planned; see
   `docs/roadrunner-identity-gate-design.md`)
-- the Klippy extra, on connect, when opted in — for an I2C- or UART-wired
-  Klipper install, over the board's usbserial admin connection
+- the Klippy extra, on connect (on by default, `auto_provision: False` to opt
+  out) — over the transport it is configured with
 
-There is no provisioning write path on I2C or UART yet, so **an I2C-only or
-UART-only installation needs a USB cable once**, even when using the Klippy
-extra's on-connect path — every route above ultimately goes over USB.
+With the Klippy extra, an I2C or UART board provisions itself on the first
+Klipper start: the extra generates a UUID, writes it, the board reboots, and
+the log shows `provisioned as RR-…`. Nothing in `printer.cfg` changes, because
+a pin or an address does not name the board. A `serial:` board provisions the
+same way, but its `/dev/serial/by-id` path contains the serial, so Klipper
+stops with a config error naming the new path to put in `printer.cfg`.
 
 ## TODO
 
@@ -67,14 +77,6 @@ extra's on-connect path — every route above ultimately goes over USB.
   reproduces what the board reports for a real build, and that the ~16 ms
   first-read cost does not disturb the sensor poll. Nothing in this feature
   has run on hardware yet.
-- [ ] Provision an unprovisioned board from Klipper instead of from a
-  workstation. A board wired for I2C or UART has no USB host attached, so
-  setting its identity today means unplugging it. Specced in
-  [docs/roadrunner-sensor-bus-provisioning-design.md](docs/roadrunner-sensor-bus-provisioning-design.md)
-  (proposed, unimplemented): staged UUID chunks plus a CRC-checked commit,
-  accepted only while the board is locked, so a provisioned board refuses every
-  write on the sensor bus. Both designs are sequenced in
-  [docs/roadrunner-identity-implementation-plan.md](docs/roadrunner-identity-implementation-plan.md).
 
 - [ ] Clear `_unhealthy` when the sensor is re-enabled. A disconnect mid-print
   pauses once and latches `_unhealthy` True. `_handle_printing` clears `_runout`
@@ -169,6 +171,10 @@ hysteresis_bits: 3
 # This setting determines the minimum detectable change in position
 # for the sensor. Configuring this too low can result in flapping between
 # two adjacent positions even when the filament is not moving.
+#auto_provision: True
+# Give an unprovisioned board a new identity the first time Klipper reads it
+# after starting. The board refuses to serve sensor data until it has one.
+# Set to False to provision boards some other way, such as mcu-updater.
 ```
 
 Two virtual pins are created for each sensor, which can be used to configure a [`filament_motion_sensor`](https://www.klipper3d.org/Config_Reference.html#filament_motion_sensor) or a [`filament_switch_sensor`](https://www.klipper3d.org/Config_Reference.html#filament_switch_sensor). This is mainly for convenience of use with user interfaces like mainsail/fluid. The virtual motion sensor will be triggered as soon as the sensor moves by the minimum detectable distance. The switch sensor will trigger when the IR sensor detects the filament is present. Both objects will work independently of the runout detection algorithm implemented in `high_resolution_filament_sensor` which considers additional factors such as underextrusion.
