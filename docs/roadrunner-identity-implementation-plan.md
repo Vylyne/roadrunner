@@ -227,6 +227,34 @@ fixes the brownout discontinuity whether or not stage 4 ships.
 - Bench, required: power-cycle a board mid-session and confirm one reset is
   counted and no phantom distance appears.
 
+**As built (`da5b6c1`)**
+
+- Resets are counted at `connection.resets`, not in `motion`, which is derived
+  entirely from the current move.
+- The rotation helper holds no state between readings, so there is nothing to
+  clear. The rebase is an offset: position is held until two consecutive polls
+  see the magnet detected, then carries on from its pre-reset value. Moves in
+  flight at the reset are dropped, because a measurement spanning it would read
+  as underextrusion.
+- The last marker survives disconnects, since a power cycle over UART is a
+  disconnect followed by a reset. A swapped board that has been up longer than
+  the old one is not caught.
+- The marker is asked of a board only once it has answered the identity
+  window; after ten consecutive failed reads the extra stops asking until the
+  board reconnects. Once a board has answered, a poll whose marker read fails
+  moves nothing.
+
+**Bench, UART DUT, 2026-09-13**
+
+- Earlier firmware without `0x25`: the extra gave up after ten reads and logged
+  it once; position reporting carried on.
+- `da5b6c1`: `reads_failed` 0 and no UART errors in steady state.
+- Soft reset (reflash of the same image, no power loss): `resets` went 0 to 1,
+  the log shows the reset at 1192 ms since boot and the rebase, and position
+  was unchanged at -1.3314 before and after. The 102 read failures were the
+  board being away while it rebooted.
+- Power cycle: not yet run.
+
 ## Stage 4 — provisioning
 
 **Firmware** — I2C and UART only
