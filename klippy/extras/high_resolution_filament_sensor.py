@@ -6,7 +6,9 @@
 import os
 import struct
 import logging
+import time
 import typing
+import uuid
 import serialhdl
 import serial
 from . import bus, filament_switch_sensor, tmc_uart, high_resolution_filament_sensor_calibration as calibration
@@ -28,6 +30,15 @@ BOOT_MARKER_GIVE_UP = 10
 # running, and the first angle it reads can move the turn count. Position is
 # rebased only once this many consecutive polls have seen the magnet detected.
 REBASE_DETECTED_POLLS = 2
+
+# Auto-provisioning over I2C and UART. After the commit the board reboots, and
+# the only acknowledgement is reading its new serial back: the identity is
+# re-read at this interval until it confirms, and a board that has not
+# confirmed by the timeout is a failure.
+PROVISION_REREAD_INTERVAL = 2.
+PROVISION_TIMEOUT = 20.
+# How long `serial:` waits for the USB admin reply to PROVISION_UUID.
+PROVISION_ADMIN_REPLY_TIMEOUT = 2.
 
 VIRTUAL_MOTION_PREFIX = 'virtual_motion_sensor'
 VIRTUAL_SWITCH_PREFIX = 'virtual_switch_sensor'
@@ -183,6 +194,72 @@ class FirmwareImage:
         SensorIdentity.unknown_status for why this is built, not written. """
         return FirmwareImage(None).get_status()
 
+class ProvisionRegister:
+    """ The write-only staging registers of a locked board, I2C and UART only.
+
+    Chunks 0-3 of the UUID go to 0x50-0x53, four bytes each, then COMMIT takes
+    {0, 0, 0, crc8_atm(uuid)}. Bytes are sent in UUID order on both transports.
+    See docs/roadrunner-sensor-bus-provisioning-design.md. """
+    CHUNK_FIRST = 0x50
+    COMMIT = 0x54
+    CHUNK_SIZE = 4
+
+# The USB admin protocol, as far as `serial:` provisioning needs it. The
+# authority is docs/roadrunner-usb-admin-protocol.md.
+ADMIN_SYNC = bytes([0x52, 0x52, 0x01])
+ADMIN_OPCODE_PROVISION_UUID = 0x03
+ADMIN_RESPONSE_BIT = 0x80
+ADMIN_STATUS_OK = 0x00
+ADMIN_STATUS_NAMES = {
+    0x00: "OK", 0x01: "BAD_CRC", 0x02: "BAD_LENGTH", 0x03: "UNPROVISIONED",
+    0x04: "ALREADY_PROVISIONED", 0x05: "IDENTITY_CONFLICT", 0x06: "IO_ERROR",
+    0x07: "CONFIRMATION_REQUIRED",
+}
+
+CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+def crc8_atm(data) -> int:
+    """ CRC-8/ATM: poly 0x07, init 0, MSB-first. The USB admin frame CRC, and
+    the COMMIT check byte. Not Trinamic's bit-reversed CRC in tmc_uart. """
+    crc = 0
+    for byte in bytes(data):
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xff if crc & 0x80 else (crc << 1) & 0xff
+    return crc
+
+def identity_serial(uuid_bytes : bytes) -> str:
+    """ The serial a board provisioned with this UUID reports: "RR-" and the
+    128 bits in 26 Crockford base32 characters, most-significant first, with
+    two zero bits in front - rr_identity_serial() in rp2040/identity_record.c. """
+    value = int.from_bytes(bytes(uuid_bytes), 'big')
+    return "RR-" + "".join(CROCKFORD_ALPHABET[(value >> (125 - 5 * i)) & 0x1f]
+                           for i in range(26))
+
+def build_admin_frame(opcode : int, payload : bytes) -> bytes:
+    body = ADMIN_SYNC + bytes([opcode, len(payload)]) + bytes(payload)
+    return body + bytes([crc8_atm(body)])
+
+def parse_admin_reply(data : bytes, opcode : int) -> typing.Optional[typing.Tuple[int, bytes]]:
+    """ Find a complete, CRC-valid reply to `opcode` in `data`, and return its
+    status and the rest of its payload; None while there is none yet. """
+    header = ADMIN_SYNC + bytes([opcode | ADMIN_RESPONSE_BIT])
+    start = 0
+    while (start := bytes(data).find(header, start)) >= 0:
+        if len(data) < start + 5:
+            return None
+        length = data[start + 4]
+        end = start + 5 + length
+        if len(data) < end + 1:
+            return None
+        if length >= 1 and crc8_atm(data[start:end]) == data[end]:
+            return data[start + 5], bytes(data[start + 6:end])
+        start += 1
+    return None
+
+def _generate_uuid() -> bytes:
+    return uuid.uuid4().bytes
+
 def decode_identity_string(data : typing.Optional[bytearray]) -> typing.Optional[str]:
     """ Decode a NUL-padded ASCII identity register.
 
@@ -332,10 +409,29 @@ class RegisterReaderGeneric:
     identity_registers = (IdentityRegister.STATE, IdentityRegister.SERIAL,
                           IdentityRegister.FIRMWARE_VERSION, IdentityRegister.VARIANT)
 
+    # Whether this transport carries the provisioning staging registers.
+    # `serial:` does not: it provisions through the USB admin protocol.
+    bus_provisioning = False
+
     def __init__(self): pass
     def read(self) -> SensorRegister: raise NotImplementedError('must be implemented in subclass')
     def read_reg(self, reg : int, length : int) -> typing.Optional[bytearray]:
         raise NotImplementedError('must be implemented in subclass')
+    def write_reg(self, reg : int, data : bytes) -> bool:
+        """ Write one register. True means the write was sent, not that the
+        board accepted it: no transport reports a refusal. """
+        raise NotImplementedError('must be implemented in subclass')
+
+    def provision(self, uuid_bytes : bytes) -> bool:
+        """ Stage a UUID in chunks and commit it. The board reboots if it
+        accepts; the caller confirms by reading the serial back. """
+        size = ProvisionRegister.CHUNK_SIZE
+        for chunk in range(len(uuid_bytes) // size):
+            if not self.write_reg(ProvisionRegister.CHUNK_FIRST + chunk,
+                                  uuid_bytes[chunk * size:(chunk + 1) * size]):
+                return False
+        return self.write_reg(ProvisionRegister.COMMIT,
+                              bytes([0, 0, 0, crc8_atm(uuid_bytes)]))
 
     def discard_partial_reads(self):
         """ Forget any half-assembled identity field. Called when the board
@@ -446,6 +542,7 @@ class RegisterReaderUART(RegisterReaderGeneric):
     # A full identity is up to 18 chunk transactions, on top of the five the
     # sensor poll makes itself. Spread them over polls instead of stalling one.
     CHUNKS_PER_ATTEMPT = 6
+    bus_provisioning = True
 
     def __init__(self, uart):
         self.uart = uart
@@ -534,8 +631,19 @@ class RegisterReaderUART(RegisterReaderGeneric):
             return
         return data
 
+    def write_reg(self, reg, data):
+        # Fire-and-forget: the datagram has no reply. tmc_uart packs the value
+        # most-significant byte first, so big-endian keeps the bytes on the
+        # wire in the order given - the same order I2C sends them.
+        self.uart.reg_write(None, 0, reg, int.from_bytes(bytes(data), 'big'))
+        return True
+
     def read(self):
         magnet_state = self.uart_read_reg1(SensorRegister.MAGNET_STATE)
+        if magnet_state == 0xff:
+            # The locked-board fill, as in decode_all(): nothing that follows
+            # is real, and a -1 turn count must not reach the position.
+            return None
         filament_presence = self.uart_read_reg1(SensorRegister.FILAMENT_PRESENCE)
         full_turns = self.uart_read_reg4(SensorRegister.FULL_TURNS)
         angle = self.uart_read_reg4(SensorRegister.ANGLE)
@@ -563,6 +671,8 @@ class RegisterReaderUART(RegisterReaderGeneric):
             return val
 
 class RegisterReaderI2C(RegisterReaderGeneric):
+    bus_provisioning = True
+
     def __init__(self, i2c, sensor_name):
         self.i2c = i2c
         self.printer = i2c.get_mcu().get_printer()
@@ -578,6 +688,15 @@ class RegisterReaderI2C(RegisterReaderGeneric):
                             % (reg, len(data), length))
             return
         return data
+
+    def write_reg(self, reg, data):
+        try:
+            self.i2c.i2c_write([reg] + list(bytes(data)))
+            return True
+        except (serialhdl.error, self.printer.command_error) as e:
+            logging.warning(f"{self.sensor_name}: Unable to write register "
+                            f"{reg:02x} via I2C: {e}")
+            return False
 
     def i2c_read_reg(self, reg, length):
         try:
@@ -646,6 +765,33 @@ class RegisterReaderSerial(RegisterReaderGeneric):
         except serial.SerialException:
             logging.error("Unable to communicate with sensor")
             return
+
+    def provision_admin(self, uuid_bytes : bytes, timeout : typing.Optional[float] = None
+                        ) -> typing.Optional[typing.Tuple[int, typing.Optional[str]]]:
+        """ Provision over the USB admin protocol, which shares this port.
+
+        No staging registers here: the admin frame carries its own length and
+        CRC. Returns the reply's status and the serial it names, or None when
+        no reply arrived - the board reboots straight after replying, so a
+        missing reply is not proof of a refusal. """
+        try:
+            self.serial.write(build_admin_frame(ADMIN_OPCODE_PROVISION_UUID,
+                                                uuid_bytes))
+            received = bytearray()
+            deadline = time.monotonic() + (
+                PROVISION_ADMIN_REPLY_TIMEOUT if timeout is None else timeout)
+            while time.monotonic() < deadline:
+                received += self.serial.read(64)
+                reply = parse_admin_reply(received, ADMIN_OPCODE_PROVISION_UUID)
+                if reply is not None:
+                    status, rest = reply
+                    serial_number = None
+                    if rest and len(rest) >= 1 + rest[0]:
+                        serial_number = rest[1:1 + rest[0]].decode("ascii", "replace")
+                    return status, serial_number
+        except serial.SerialException:
+            logging.exception("Unable to provision the sensor over serial")
+        return None
 
 class SensorRotationHelper:
     """ Helper class used to convert raw point-in-time readings from the sensor
@@ -957,6 +1103,9 @@ class HighResolutionFilamentSensor:
         self.underextrusion_period = config.getfloat('underextrusion_period', minval=0.0)
         self.move_evaluation_distance = config.getfloat('move_evaluation_distance', 3, minval=0.0)
         self.hysteresis_bits = config.getint('hysteresis_bits', 3, minval=0, maxval=12) # ignore lower 3 bits by default
+        # Give an unprovisioned board a fresh identity instead of only
+        # reporting that it has none.
+        self.auto_provision = config.getboolean('auto_provision', True)
 
         # Printer state
         self._commanded_moves : list[CommandedMove] = []
@@ -987,6 +1136,16 @@ class HighResolutionFilamentSensor:
         self._reads_ok = 0
         self._reads_failed = 0
         self._consecutive_failures = 0
+        # A locked board is held disconnected until a provisioned identity is
+        # read back, and its identity is re-read at `_identity_recheck_at`
+        # because nothing else would notice it being provisioned.
+        self._identity_locked = False
+        self._identity_recheck_at = 0.
+        # Provisioning happens on the first identity read after klippy:ready
+        # and never again: a board rebooted mid-session would move position.
+        self._provision_armed = False
+        self._provision_expected : typing.Optional[str] = None
+        self._provision_deadline = 0.
 
         # Reset detection. The marker is kept across disconnects: a power cycle
         # is a disconnect followed by a reset, and forgetting the old value on
@@ -1086,6 +1245,59 @@ class HighResolutionFilamentSensor:
             # another Klipper instance, or a host tool that did not let go.
             raise self.printer.config_error(
                 f"{self.name}: Could not connect to {self.serial_port}: {e}")
+        if self.serial_port and self.auto_provision:
+            self._provision_over_serial()
+
+    def _provision_over_serial(self):
+        """ Provision a locked `serial:` board, then stop Klipper.
+
+        This transport cannot carry on afterwards: the board reboots under a
+        new USB serial number, so the /dev/serial/by-id path in the config
+        stops existing. The config error is the whole flow - it names the new
+        serial and the line to change. """
+        try:
+            identity = self.regs.read_identity()
+        except Exception:
+            logging.exception(f"{self.name}: reading the identity registers failed")
+            return
+        if identity is None or identity is READ_PENDING or identity.provisioned:
+            return
+
+        new_uuid = _generate_uuid()
+        expected = identity_serial(new_uuid)
+        old_serial = identity.serial or "RR-UNPROVISIONED"
+        if old_serial in self.serial_port:
+            new_port = self.serial_port.replace(old_serial, expected)
+        else:
+            new_port = f"/dev/serial/by-id/usb-Vylyne_Roadrunner_{expected}-if00"
+        logging.info(f"{self.name}: board at {self.serial_port} is not "
+                     f"provisioned; provisioning it as {expected}")
+
+        reply = self.regs.provision_admin(new_uuid)
+        if reply is None:
+            raise self.printer.config_error(
+                f"{self.name}: the board at {self.serial_port} is not "
+                f"provisioned. It was sent the identity {expected} but did not "
+                f"acknowledge it. If it comes back as {expected}, change "
+                f"'serial: {self.serial_port}' to 'serial: {new_port}'; "
+                f"otherwise provision it with scripts/roadrunner_admin.py.")
+        status, serial_number = reply
+        if status != ADMIN_STATUS_OK:
+            raise self.printer.config_error(
+                f"{self.name}: the board at {self.serial_port} is not "
+                f"provisioned and refused the identity {expected} "
+                f"({ADMIN_STATUS_NAMES.get(status, f'status {status:#04x}')}). "
+                f"Provision it with scripts/roadrunner_admin.py.")
+        if serial_number != expected:
+            raise self.printer.config_error(
+                f"{self.name}: the board at {self.serial_port} was sent the "
+                f"identity {expected} but reports {serial_number}. Check it "
+                f"with scripts/roadrunner_admin.py.")
+        raise self.printer.config_error(
+            f"{self.name}: the board at {self.serial_port} was not provisioned "
+            f"and is now {expected}. It has rebooted under that name, so "
+            f"change 'serial: {self.serial_port}' to 'serial: {new_port}' and "
+            f"restart.")
 
     def setup_buttons(self, prefix, klass):
         """ Register virtual buttons for use with filament_motion_sensor and filament_switch_sensor. """
@@ -1284,22 +1496,38 @@ class HighResolutionFilamentSensor:
 
         Failure here is never fatal. A board that will not say who it is still
         reports filament, and taking Klippy down over a blank status field
-        would be a far worse outcome than the blank field. """
+        would be a far worse outcome than the blank field.
+
+        The exceptions are provisioning. A locked board is re-read on the slow
+        timer, since sensor_connected is held false for it and the reconnect
+        that normally drops this cache never comes. And a failed auto-provision
+        stops the printer, because a board that silently kept no identity is
+        worse than a startup error. """
+        if self._identity is not None and not self._identity.provisioned \
+                and eventtime >= self._identity_recheck_at:
+            self._identity = None
+
         if (self._identity is not None and self._firmware_image is not None) \
                 or eventtime < self._identity_next_attempt:
             return
 
-        self._identity_next_attempt = eventtime + IDENTITY_RETRY_TIMEOUT
+        pending = self._provision_expected is not None
+        self._identity_next_attempt = eventtime + (
+            PROVISION_REREAD_INTERVAL if pending else IDENTITY_RETRY_TIMEOUT)
         try:
             identity = self.regs.read_identity() if self._identity is None \
                 else self._identity
         except Exception:
             logging.exception(f"{self.name}: reading the identity registers failed")
-            return
+            identity = None
 
         if identity is None:
             # The board is not answering the window at all. Reading the image
             # registers now would only add failures to the same retry.
+            if pending and eventtime >= self._provision_deadline:
+                self._provision_failed(
+                    f"did not answer within {PROVISION_TIMEOUT:.0f}s of being "
+                    f"sent the identity {self._provision_expected}")
             return
 
         if identity is READ_PENDING:
@@ -1309,16 +1537,27 @@ class HighResolutionFilamentSensor:
             return
 
         if self._identity is None:
+            if pending and not self._provision_settled(identity, eventtime):
+                return
+            was_locked = self._identity_locked
             self._identity = identity
+            self._identity_locked = not identity.provisioned
             logging.info(f"{self.name}: identity {identity!r}")
+            armed, self._provision_armed = self._provision_armed, False
             if not identity.provisioned:
-                # The one thing this whole window exists to make sayable: the
-                # board is answering, and it is refusing on purpose. Said once
-                # per read, not again on every attempt at the image registers.
-                self._respond_error(
-                    f"board is not provisioned (identity {identity.state}), so "
-                    f"it refuses to report sensor data. Provision it with "
-                    f"scripts/roadrunner_admin.py over USB.")
+                self._identity_recheck_at = eventtime + IDENTITY_RETRY_TIMEOUT
+                if armed and self.auto_provision and self.regs.bus_provisioning:
+                    self._provision(eventtime)
+                    return
+                if not was_locked:
+                    # The one thing this whole window exists to make sayable:
+                    # the board is answering, and it is refusing on purpose.
+                    # Said once, not again on every recheck or every attempt at
+                    # the image registers.
+                    self._respond_error(
+                        f"board is not provisioned (identity {identity.state}), "
+                        f"so it refuses to report sensor data. Provision it with "
+                        f"scripts/roadrunner_admin.py over USB.")
 
         if self._firmware_image is None:
             try:
@@ -1332,6 +1571,69 @@ class HighResolutionFilamentSensor:
             elif image is not None:
                 self._firmware_image = image
                 logging.info(f"{self.name}: firmware image {image!r}")
+
+    def _provision(self, eventtime):
+        """ Stage and commit a fresh UUID over I2C or UART, and return.
+
+        Nothing waits here. The board reboots, and _update_identity re-reads
+        the identity every PROVISION_REREAD_INTERVAL until it reads the serial
+        this sent - that read-back is the acknowledgement. """
+        new_uuid = _generate_uuid()
+        expected = identity_serial(new_uuid)
+        try:
+            sent = self.regs.provision(new_uuid)
+        except Exception:
+            logging.exception(f"{self.name}: writing the provisioning registers failed")
+            sent = False
+        if not sent:
+            self._provision_failed(
+                f"could not be sent the identity {expected}: writing its "
+                f"provisioning registers failed")
+            return
+
+        self._provision_expected = expected
+        self._provision_deadline = eventtime + PROVISION_TIMEOUT
+        self._identity = None
+        self._identity_next_attempt = eventtime + PROVISION_REREAD_INTERVAL
+        self.regs.discard_partial_reads()
+        self._respond_info(
+            f"board is not provisioned; provisioning it as {expected} "
+            f"(auto_provision). It reboots, and reports sensor data once the "
+            f"new identity reads back.", log=True)
+
+    def _provision_settled(self, identity, eventtime) -> bool:
+        """ Judge an identity read while provisioning is in flight. True when
+        it settles the attempt either way; False to keep re-reading. """
+        expected = self._provision_expected
+        if identity.provisioned and identity.serial == expected:
+            self._provision_expected = None
+            self._respond_info(f"provisioned as {expected}", log=True)
+            return True
+        if identity.provisioned and identity.serial is not None:
+            self._provision_failed(
+                f"was sent the identity {expected} but came back as "
+                f"{identity.serial}")
+            return True
+        if eventtime < self._provision_deadline:
+            # Not rebooted yet, or its serial did not read this time.
+            return False
+        if identity.provisioned:
+            self._provision_failed(
+                f"came back provisioned, but its serial could not be read to "
+                f"confirm it is {expected}")
+        else:
+            self._provision_failed(
+                f"was sent the identity {expected} but is still unprovisioned "
+                f"after {PROVISION_TIMEOUT:.0f}s; it refused the commit")
+        return True
+
+    def _provision_failed(self, reason):
+        self._provision_expected = None
+        msg = (f"{self.name}: auto_provision failed: the board {reason}. "
+               f"Provision it with scripts/roadrunner_admin.py over USB, or set "
+               f"auto_provision: False.")
+        logging.error(msg)
+        self.printer.invoke_shutdown(msg)
 
     def _read_boot_marker(self) -> typing.Optional[int]:
         """ Milliseconds since the board booted, or None when there is no
@@ -1398,7 +1700,12 @@ class HighResolutionFilamentSensor:
         else:
             self._reads_failed += 1
             self._consecutive_failures += 1
-        self._sensor_connected.set(bool(regs and regs.connected), eventtime)
+        # A locked board's fill is already refused by the readers. This also
+        # covers the provisioning window, from the commit until a provisioned
+        # identity reads back, whatever the registers say meanwhile.
+        self._sensor_connected.set(
+            bool(regs and regs.connected) and not self._identity_locked,
+            eventtime)
         if not self._sensor_connected:
             return
 
@@ -1465,6 +1772,9 @@ class HighResolutionFilamentSensor:
         self.orig_extruder_process_move = self.extruder.process_move
         self.extruder.process_move = self._capture_extruder_move
 
+        # Position is still zero, so a provisioning reboot on the first
+        # identity read cannot fake a move.
+        self._provision_armed = True
         self.reactor.update_timer(self._sensor_update_timer, self.reactor.NOW)
 
     def _handle_homing_begin(self, hmove):

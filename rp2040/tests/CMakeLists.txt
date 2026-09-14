@@ -64,6 +64,7 @@ add_test(NAME i2c_target COMMAND roadrunner_i2c_target_tests)
 add_executable(roadrunner_sensor_bus_provision_tests
     test_sensor_bus_provision.c
     ../sensor_bus_provision.c
+    ../identity_record.c
 )
 target_include_directories(roadrunner_sensor_bus_provision_tests PRIVATE ..)
 

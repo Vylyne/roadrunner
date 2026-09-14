@@ -457,6 +457,12 @@ def _bare_sensor(module, reader):
     sensor._firmware_image = None
     sensor._identity_next_attempt = 0.
     sensor._boot_marker_supported = None
+    sensor._identity_locked = False
+    sensor._identity_recheck_at = 0.
+    sensor._provision_armed = False
+    sensor._provision_expected = None
+    sensor._provision_deadline = 0.
+    sensor.auto_provision = True
     sensor.errors = []
     sensor._respond_error = sensor.errors.append
     return sensor
@@ -1044,4 +1050,363 @@ def test_a_board_that_has_not_answered_identity_is_not_asked(monkeypatch):
 
     assert board.marker_reads == 0
     assert sensor.position == pytest.approx(1.)
+
+
+# --- Provisioning over the sensor bus (registers 0x50-0x54) ----------------
+
+COUNTING_UUID = bytes(range(16))
+COUNTING_SERIAL = "RR-00041061050R3GG28A1C60T3GF"
+
+
+class ConfigError(Exception):
+    pass
+
+
+def test_the_commit_crc_and_serial_match_the_firmware_golden_values(monkeypatch):
+    """Pinned in rp2040/tests/test_sensor_bus_provision.c too."""
+    module = _load_extra(monkeypatch)
+
+    assert module.crc8_atm(b"123456789") == 0xf4
+    assert module.crc8_atm(COUNTING_UUID) == 0x41
+    assert module.identity_serial(COUNTING_UUID) == COUNTING_SERIAL
+    assert module.identity_serial(bytes(16)) == "RR-" + "0" * 26
+
+
+def test_i2c_stages_four_chunks_then_commits(monkeypatch):
+    module = _load_extra(monkeypatch)
+
+    class I2C:
+        def __init__(self):
+            self.writes = []
+
+        def get_mcu(self):
+            printer = types.SimpleNamespace(command_error=RuntimeError)
+            return types.SimpleNamespace(get_printer=lambda: printer)
+
+        def i2c_write(self, data):
+            self.writes.append(list(data))
+
+    i2c = I2C()
+    assert module.RegisterReaderI2C(i2c, "roadrunner").provision(COUNTING_UUID)
+
+    assert i2c.writes == [
+        [0x50, 0x00, 0x01, 0x02, 0x03],
+        [0x51, 0x04, 0x05, 0x06, 0x07],
+        [0x52, 0x08, 0x09, 0x0a, 0x0b],
+        [0x53, 0x0c, 0x0d, 0x0e, 0x0f],
+        [0x54, 0x00, 0x00, 0x00, 0x41],
+    ]
+
+
+def test_uart_sends_the_same_bytes_most_significant_first(monkeypatch):
+    """tmc_uart packs a write value MSB-first, so a big-endian value puts the
+    UUID on the wire in the same order as I2C - the firmware stages wire
+    order on both."""
+    module = _load_extra(monkeypatch)
+
+    class Uart:
+        def __init__(self):
+            self.writes = []
+
+        def reg_write(self, instance_id, addr, reg, val):
+            self.writes.append((instance_id, addr, reg, val))
+
+    uart = Uart()
+    assert module.RegisterReaderUART(uart).provision(COUNTING_UUID)
+
+    assert uart.writes == [
+        (None, 0, 0x50, 0x00010203),
+        (None, 0, 0x51, 0x04050607),
+        (None, 0, 0x52, 0x08090a0b),
+        (None, 0, 0x53, 0x0c0d0e0f),
+        (None, 0, 0x54, 0x00000041),
+    ]
+
+
+def test_a_locked_uart_board_reads_disconnected(monkeypatch):
+    """The 0xff fill decodes to a -1 turn count, which must not reach the
+    position. decode_all() already refuses it for I2C and serial."""
+    module = _load_extra(monkeypatch)
+
+    class LockedUart:
+        def reg_read(self, _instance_id, _addr, _reg, length):
+            return bytearray([0xff] * length)
+
+    assert module.RegisterReaderUART(LockedUart()).read() is None
+
+
+class ProvisioningBoard:
+    """A bus board that is locked until it takes a commit, then reboots.
+
+    `accept=False` models a refused commit. `answer_as` makes the board come
+    back under a serial other than the one it was sent. `offline_polls` is how
+    many sensor polls the reboot takes."""
+
+    bus_provisioning = True
+
+    def __init__(self, module, accept=True, answer_as=None, offline_polls=5):
+        self.module = module
+        self.accept = accept
+        self.answer_as = answer_as
+        self.offline_polls = offline_polls
+        self.state = 0
+        self.serial = b"RR-UNPROVISIONED"
+        self.offline = 0
+        self.provisioned_with = []
+        self.identity_registers = module.RegisterReaderGeneric.identity_registers
+        self.image_registers = module.RegisterReaderGeneric.image_registers
+
+    def read_identity(self):
+        return self.module.RegisterReaderGeneric.read_identity(self)
+
+    def read_firmware_image(self):
+        return self.module.RegisterReaderGeneric.read_firmware_image(self)
+
+    def discard_partial_reads(self):
+        pass
+
+    def provision(self, uuid_bytes):
+        self.provisioned_with.append(bytes(uuid_bytes))
+        if self.accept:
+            self.state = 1
+            self.serial = (self.answer_as
+                           or self.module.identity_serial(uuid_bytes)).encode()
+            self.offline = self.offline_polls
+        return True
+
+    def read_reg(self, reg, length):
+        if self.offline:
+            return None
+        data = _identity_payloads(
+            self.module, state=self.state, serial=self.serial).get(reg)
+        return bytearray(data) if data is not None else None
+
+    def read(self):
+        if self.offline:
+            self.offline -= 1
+            return None
+        if self.state != 1:
+            return None  # the locked fill, as the readers report it
+        return self.module.SensorRegister(DETECTED, 1, 0, 0)
+
+
+def _provisioning_sensor(module, board, monkeypatch):
+    monkeypatch.setattr(module, "_generate_uuid", lambda: COUNTING_UUID)
+    sensor = _polling_sensor(module, board)
+    del sensor._update_identity  # the real one, this time
+    sensor._identity = None
+    sensor.clock = types.SimpleNamespace(now=0.)
+    sensor.reactor = types.SimpleNamespace(monotonic=lambda: sensor.clock.now)
+    sensor.shutdowns = []
+    sensor.printer = types.SimpleNamespace(
+        invoke_shutdown=sensor.shutdowns.append, config_error=ConfigError)
+    sensor._sensor_connected = module.TriggerOnChange(
+        None, sensor._sensor_connected_changed)
+    # As _handle_ready leaves it.
+    sensor._provision_armed = True
+    return sensor
+
+
+def _poll_for(sensor, seconds, step=0.1):
+    end = sensor.clock.now + seconds
+    while sensor.clock.now < end:
+        sensor._update_state_from_sensor()
+        sensor.clock.now += step
+
+
+def test_a_locked_bus_board_is_provisioned_and_confirmed_by_its_serial(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ProvisioningBoard(module)
+    sensor = _provisioning_sensor(module, board, monkeypatch)
+
+    sensor._update_state_from_sensor()
+    assert board.provisioned_with == [COUNTING_UUID]
+    assert not sensor._sensor_connected
+
+    _poll_for(sensor, 1.)
+    # Rebooted and answering, but not confirmed yet: still held disconnected.
+    assert not sensor._sensor_connected
+
+    _poll_for(sensor, 5.)
+    assert sensor.shutdowns == []
+    assert sensor._identity.serial == COUNTING_SERIAL
+    assert sensor._sensor_connected
+    assert any(f"provisioned as {COUNTING_SERIAL}" in m for m in sensor.infos)
+    assert not any("not provisioned (identity" in m for m in sensor.errors)
+
+    _poll_for(sensor, 30.)
+    assert board.provisioned_with == [COUNTING_UUID]
+
+
+def test_auto_provision_false_leaves_a_locked_board_alone(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ProvisioningBoard(module)
+    sensor = _provisioning_sensor(module, board, monkeypatch)
+    sensor.auto_provision = False
+
+    _poll_for(sensor, 30.)
+
+    assert board.provisioned_with == []
+    assert not sensor._sensor_connected
+    assert sensor.shutdowns == []
+    # Rechecked on the slow timer, but said once.
+    assert len(sensor.errors) == 1
+    assert "not provisioned" in sensor.errors[0]
+
+
+def test_only_the_first_identity_read_after_ready_provisions(monkeypatch):
+    """A reboot later in the session would inject a false move."""
+    module = _load_extra(monkeypatch)
+    board = ProvisioningBoard(module)
+    sensor = _provisioning_sensor(module, board, monkeypatch)
+    sensor._provision_armed = False
+
+    _poll_for(sensor, 30.)
+
+    assert board.provisioned_with == []
+
+
+def test_a_board_provisioned_over_usb_while_running_is_picked_up(monkeypatch):
+    """Held disconnected while locked, so no reconnect will drop the cached
+    identity: the slow recheck has to notice instead."""
+    module = _load_extra(monkeypatch)
+    board = ProvisioningBoard(module)
+    sensor = _provisioning_sensor(module, board, monkeypatch)
+    sensor.auto_provision = False
+
+    _poll_for(sensor, 1.)
+    assert not sensor._sensor_connected
+    board.state, board.serial = 1, b"RR-0001"
+
+    _poll_for(sensor, module.IDENTITY_RETRY_TIMEOUT + 1.)
+
+    assert sensor._identity.serial == "RR-0001"
+    assert sensor._sensor_connected
+
+
+def test_a_board_that_comes_back_under_another_serial_stops_the_printer(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ProvisioningBoard(module, answer_as="RR-7HZHY879879X19ZQZTJYQ7DDRB")
+    sensor = _provisioning_sensor(module, board, monkeypatch)
+
+    _poll_for(sensor, 5.)
+
+    assert len(sensor.shutdowns) == 1
+    assert "RR-7HZHY879879X19ZQZTJYQ7DDRB" in sensor.shutdowns[0]
+    assert COUNTING_SERIAL in sensor.shutdowns[0]
+
+
+def test_a_refused_commit_stops_the_printer_after_the_timeout(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ProvisioningBoard(module, accept=False)
+    sensor = _provisioning_sensor(module, board, monkeypatch)
+
+    _poll_for(sensor, module.PROVISION_TIMEOUT - 1.)
+    assert sensor.shutdowns == []
+    assert not sensor._sensor_connected
+
+    _poll_for(sensor, module.PROVISION_REREAD_INTERVAL + 1.)
+    assert len(sensor.shutdowns) == 1
+    assert "still unprovisioned" in sensor.shutdowns[0]
+
+
+def test_a_board_that_never_returns_stops_the_printer(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ProvisioningBoard(module, offline_polls=10**6)
+    sensor = _provisioning_sensor(module, board, monkeypatch)
+
+    _poll_for(sensor, module.PROVISION_TIMEOUT + module.PROVISION_REREAD_INTERVAL + 1.)
+
+    assert len(sensor.shutdowns) == 1
+    assert "did not answer" in sensor.shutdowns[0]
+
+
+class AdminPort:
+    """A `serial:` board: legacy 0xf5 register reads and USB admin frames on
+    the one CDC port."""
+
+    def __init__(self, module, state=0, reply=True):
+        self.module = module
+        self.state = state
+        self.reply = reply
+        self.written = []
+        self.pending = bytearray()
+
+    def write(self, data):
+        data = bytes(data)
+        self.written.append(data)
+        if data[:1] == b"\xf5":
+            payload = _identity_payloads(
+                self.module, state=self.state,
+                serial=b"RR-UNPROVISIONED").get(data[1])
+            if payload is not None:
+                self.pending += bytes([0x05, 0xff, data[1]]) + payload
+        elif data[:3] == self.module.ADMIN_SYNC and self.reply:
+            serial = self.module.identity_serial(data[5:21]).encode()
+            body = self.module.ADMIN_SYNC + bytes(
+                [0x83, 2 + len(serial), 0x00, len(serial)]) + serial
+            self.pending += body + bytes([self.module.crc8_atm(body)])
+        return len(data)
+
+    def read(self, size=1):
+        out = bytes(self.pending[:size])
+        del self.pending[:size]
+        return out
+
+
+def _serial_sensor(module, port, monkeypatch, auto_provision=True):
+    monkeypatch.setattr(module, "_generate_uuid", lambda: COUNTING_UUID)
+    sensor = object.__new__(module.HighResolutionFilamentSensor)
+    sensor.name = "roadrunner"
+    sensor.serial_port = \
+        "/dev/serial/by-id/usb-Vylyne_Roadrunner_RR-UNPROVISIONED-if00"
+    sensor.baud = 115200
+    sensor.auto_provision = auto_provision
+    sensor.printer = types.SimpleNamespace(config_error=ConfigError)
+    sensor._open_serial = lambda: port
+    return sensor
+
+
+def test_serial_provisions_over_the_admin_protocol_and_names_the_new_port(monkeypatch):
+    """The by-id path in the config stops existing once the board reboots, so
+    this transport stops with the line to change rather than carrying on."""
+    module = _load_extra(monkeypatch)
+    port = AdminPort(module)
+    sensor = _serial_sensor(module, port, monkeypatch)
+
+    with pytest.raises(ConfigError) as raised:
+        sensor._handle_connect()
+
+    # Golden frame, cross-checked against scripts/roadrunner_admin.py.
+    assert port.written[-1] == bytes.fromhex(
+        "52 52 01 03 10 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f d2")
+    assert not any(w[:1] == b"\xf5" and 0x50 <= w[1] <= 0x54 for w in port.written)
+    message = str(raised.value)
+    assert f"is now {COUNTING_SERIAL}" in message
+    assert f"usb-Vylyne_Roadrunner_{COUNTING_SERIAL}-if00" in message
+
+
+def test_serial_without_a_reply_still_stops_and_says_what_was_sent(monkeypatch):
+    module = _load_extra(monkeypatch)
+    monkeypatch.setattr(module, "PROVISION_ADMIN_REPLY_TIMEOUT", 0.05)
+    port = AdminPort(module, reply=False)
+    sensor = _serial_sensor(module, port, monkeypatch)
+
+    with pytest.raises(ConfigError) as raised:
+        sensor._handle_connect()
+
+    assert "did not acknowledge" in str(raised.value)
+    assert COUNTING_SERIAL in str(raised.value)
+
+
+def test_serial_auto_provision_false_or_a_provisioned_board_connects_quietly(monkeypatch):
+    module = _load_extra(monkeypatch)
+
+    port = AdminPort(module)
+    _serial_sensor(module, port, monkeypatch, auto_provision=False)._handle_connect()
+    assert port.written == []
+
+    port = AdminPort(module, state=1)
+    _serial_sensor(module, port, monkeypatch)._handle_connect()
+    assert not any(w[:3] == module.ADMIN_SYNC for w in port.written)
 

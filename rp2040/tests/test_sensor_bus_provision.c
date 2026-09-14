@@ -6,6 +6,7 @@
  * pins on the Klippy side too. */
 
 #include "sensor_bus_provision.h"
+#include "identity_record.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -56,6 +57,16 @@ static void test_crc_matches_the_golden_values(void)
 {
     assert(rr_sensor_bus_provision_crc8((const uint8_t *)"123456789", 9u) == 0xf4);
     assert(rr_sensor_bus_provision_crc8(counting_uuid, 16u) == counting_uuid_crc);
+}
+
+/* The serial the host expects back after committing this UUID. Klippy's
+ * identity_serial() pins the same string, so the two cannot drift apart. */
+static void test_the_committed_uuid_names_the_expected_serial(void)
+{
+    char serial[RR_IDENTITY_SERIAL_LENGTH + 1];
+
+    rr_identity_serial(counting_uuid, serial);
+    assert(strcmp(serial, "RR-00041061050R3GG28A1C60T3GF") == 0);
 }
 
 static void test_a_complete_stage_commits_once(void)
@@ -235,6 +246,7 @@ static void test_reset_drops_a_parked_commit(void)
 int main(void)
 {
     test_crc_matches_the_golden_values();
+    test_the_committed_uuid_names_the_expected_serial();
     test_a_complete_stage_commits_once();
     test_chunks_after_zero_may_arrive_in_any_order();
     test_a_provisioned_board_refuses_every_write();
