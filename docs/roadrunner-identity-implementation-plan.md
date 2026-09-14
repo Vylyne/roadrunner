@@ -387,8 +387,11 @@ forever. The host computes the CRC over the UUID it intends, so a splice fails.
   The status object reported that serial with `state: ok`, and USB enumerated
   as `usb-Vylyne_Roadrunner_RR-6CWMKS36PQ9V9RN2ZW9B8901N1-if00`, so the
   identity written over UART is the one the board serves on USB too.
-- No UART errors in steady state afterwards; `resets` stayed 0, because the
-  boot marker is not asked of a board until its identity has answered.
+- No UART errors in steady state afterwards. `resets` stayed 0 and position
+  held at -1.3314: this Klipper process never had a marker from before the
+  reboot, since a locked board answers `0x25` with the locked fill, which the
+  extra reads as no marker. So the provisioning reboot is not counted as a
+  reset, and it injected no move.
 - A second Klipper restart read the provisioned board and connected with no
   provisioning, no UART errors and `reads_failed` 0.
 - Not exercised on hardware: I2C, the `serial:` admin path, and every failure
