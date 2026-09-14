@@ -378,8 +378,10 @@ forever. The host computes the CRC over the UUID it intends, so a splice fails.
   its own `i2c_transfer` query and treats a bus error as the board being away
   (`expect_reboot()`), so the read-back and the 20 s timeout decide as on UART.
   Outside that window a vanished I2C board still shuts the printer down, as
-  before. MCU code old enough to have `i2c_read` fails a bad read on the MCU,
-  so there it is unchanged. A read `bus.py` has already failed now returns
+  before. MCU code old enough to have `i2c_read` fails a bad read on the MCU
+  itself, which the host cannot catch, so on such an MCU the provisioning
+  reboot still shuts the printer down; the board is provisioned and reads back
+  after `FIRMWARE_RESTART`. A read `bus.py` has already failed now returns
   nothing instead of raising `TypeError` in the poll timer.
 
 **Bench, UART DUT, 2026-09-13** — firmware `0defa59` (`roadrunner_v1_uart_rgb`)
@@ -426,7 +428,8 @@ the same firmware sources), Klipper MCU on `i2c0b` at address 64, 100 kHz
   0.
 - Not exercised on hardware: the `serial:` admin path, and every failure path
   (refused commit, wrong serial, board never returns). Those rest on the host
-  tests.
+  tests. The bench MCU's Klipper declares only `i2c_transfer`; I2C
+  provisioning on MCU code that still has `i2c_read` was not tried.
 
 ## Carried over, not part of this plan
 
