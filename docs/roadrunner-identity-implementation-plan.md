@@ -426,10 +426,23 @@ the same firmware sources), Klipper MCU on `i2c0b` at address 64, 100 kHz
   0. USB enumerated under the same serial.
 - A further Klipper restart connected with no provisioning and `reads_failed`
   0.
-- Not exercised on hardware: the `serial:` admin path, and every failure path
-  (refused commit, wrong serial, board never returns). Those rest on the host
-  tests. The bench MCU's Klipper declares only `i2c_transfer`; I2C
+- Not exercised on hardware: every failure path (refused commit, wrong serial,
+  board never returns). Those rest on the host tests. The bench MCU's Klipper declares only `i2c_transfer`; I2C
   provisioning on MCU code that still has `i2c_read` was not tried.
+
+**Bench, USB serial DUT, 2026-09-14** — firmware `d005faa`
+(`roadrunner_v1_usbserial_rgb`, the same firmware sources), extra at `d005faa`
+
+- `roadrunner-usb.cfg` sets `serial:` to the board's by-id path.
+- After `roadrunner_admin.py clear` the board enumerated as
+  `RR-UNPROVISIONED` and the config named that path. Klipper logged
+  `provisioning it as RR-0Q61C61NWP81DSKKS4MB8JH3Y6` and halted with the
+  config error, which named the new path
+  `usb-Vylyne_Roadrunner_RR-0Q61C61NWP81DSKKS4MB8JH3Y6-if00`. The board had
+  already re-enumerated under it.
+- With `serial:` changed to that path, Klipper came up `ready` with no
+  provisioning. The status object showed that serial, `state: ok`,
+  `transport: usb`, `reads_failed` 0 and `resets` 0.
 
 ## Carried over, not part of this plan
 
