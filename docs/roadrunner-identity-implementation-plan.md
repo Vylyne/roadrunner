@@ -371,6 +371,16 @@ forever. The host computes the CRC over the UUID it intends, so a splice fails.
   reading, so it no longer decodes as `full_turns = -1`.
 - An I2C write that fails at the bus fails provisioning at once rather than
   waiting out the timeout.
+- Fixed after the first I2C bench run (`d005faa`). "The poll timer sees the
+  disconnect" does not hold on I2C: Klipper's `bus.py` invokes a shutdown on
+  any I2C bus error, so the first poll during the board's reboot shut the
+  printer down. While a commit is pending, `RegisterReaderI2C` reads through
+  its own `i2c_transfer` query and treats a bus error as the board being away
+  (`expect_reboot()`), so the read-back and the 20 s timeout decide as on UART.
+  Outside that window a vanished I2C board still shuts the printer down, as
+  before. MCU code old enough to have `i2c_read` fails a bad read on the MCU,
+  so there it is unchanged. A read `bus.py` has already failed now returns
+  nothing instead of raising `TypeError` in the poll timer.
 
 **Bench, UART DUT, 2026-09-13** — firmware `0defa59` (`roadrunner_v1_uart_rgb`)
 
@@ -394,9 +404,29 @@ forever. The host computes the CRC over the UUID it intends, so a splice fails.
   reset, and it injected no move.
 - A second Klipper restart read the provisioned board and connected with no
   provisioning, no UART errors and `reads_failed` 0.
-- Not exercised on hardware: I2C, the `serial:` admin path, and every failure
-  path (refused commit, wrong serial, board never returns). Those rest on the
-  host tests.
+
+**Bench, I2C DUT, 2026-09-13** — firmware `1085d1e` (`roadrunner_v1_i2c_rgb`,
+the same firmware sources), Klipper MCU on `i2c0b` at address 64, 100 kHz
+
+- The bench config now includes one of `roadrunner-i2c.cfg` or
+  `roadrunner-uart.cfg` for the `dut` section, so switching transport is one
+  line.
+- First run, extra at `1085d1e`: the board took the commit over I2C, rebooted
+  and enumerated on USB as `RR-57K05Y10T88JF9RPRGE5S128S5`, but the next poll
+  got `BUS_TIMEOUT` and `bus.py` shut the printer down, followed by a
+  `TypeError` in the poll timer. After `FIRMWARE_RESTART` the board read back
+  over I2C as that serial with `state: ok`, so the firmware half had worked.
+- Second run, extra at `d005faa`, board cleared again: `provisioning it as
+  RR-21B0YQ8Y4K9DBT2GTJVSE4HR3G`, then one `BUS_TIMEOUT` and one
+  `START_READ_NACK` logged as the board rebooting, then `provisioned as
+  RR-21B0YQ8Y4K9DBT2GTJVSE4HR3G`, `sensor_connected` false to true, printer
+  `ready`. `reads_failed` 2, both during the reboot; position -1.3314, `resets`
+  0. USB enumerated under the same serial.
+- A further Klipper restart connected with no provisioning and `reads_failed`
+  0.
+- Not exercised on hardware: the `serial:` admin path, and every failure path
+  (refused commit, wrong serial, board never returns). Those rest on the host
+  tests.
 
 ## Carried over, not part of this plan
 
