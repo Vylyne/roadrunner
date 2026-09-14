@@ -19,9 +19,12 @@ static struct
     size_t mem_position; /* next byte of mem[] to serve on I2C_SLAVE_REQUEST */
     uint8_t mem_address;
     bool mem_address_written;
+    uint8_t write_data[4]; /* the first bytes written after the address */
+    size_t write_length;   /* every byte written after the address, counted */
 } context;
 
 void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length);
+void sensor_bus_register_write(uint8_t reg, const uint8_t *data, size_t length);
 
 static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
     switch (event) {
@@ -43,8 +46,18 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
             context.mem_position = 0;
             prepare_register_data(context.mem_address, context.mem, &context.mem_length);
         } else {
-            /* read and discard, we do not support I2C writes */
-            i2c_read_byte_raw(i2c);
+            /* Register data. Only the provisioning staging registers accept
+             * any, and none takes more than four bytes; the rest are counted
+             * so an oversized write is recognised and ignored rather than
+             * truncated into something that looks valid. */
+            uint8_t byte = i2c_read_byte_raw(i2c);
+
+            if (context.write_length < sizeof(context.write_data)) {
+                context.write_data[context.write_length] = byte;
+            }
+            if (context.write_length < SIZE_MAX) {
+                context.write_length++;
+            }
         }
         break;
     case I2C_SLAVE_REQUEST: // master is requesting data
@@ -71,7 +84,19 @@ static void i2c_slave_handler(i2c_inst_t *i2c, i2c_slave_event_t event) {
          * cached payload built in I2C_SLAVE_RECEIVE must survive into the
          * read phase. Only mem_address_written is reset, so the next write
          * is treated as a fresh register address; mem_length/mem_position
-         * are re-armed there too, at the point a new address arrives. */
+         * are re-armed there too, at the point a new address arrives.
+         *
+         * A write carrying data ends here as well, and is handed on only now
+         * that its length is known. An address-then-read transaction reaches
+         * FINISH with no data bytes, so reads never get this far. Refusals
+         * are silent: the peripheral has already ACKed every byte, and the
+         * host confirms provisioning by reading the serial back, not by the
+         * bus acknowledgement. */
+        if (context.mem_address_written && context.write_length > 0) {
+            sensor_bus_register_write(context.mem_address, context.write_data,
+                                      context.write_length);
+        }
+        context.write_length = 0;
         context.mem_address_written = false;
         break;
     default:

@@ -60,6 +60,24 @@ target_include_directories(roadrunner_i2c_target_tests PRIVATE stubs ..)
 
 add_test(NAME i2c_target COMMAND roadrunner_i2c_target_tests)
 
+# The provisioning stage behind registers 0x50-0x54, with CRC golden values.
+add_executable(roadrunner_sensor_bus_provision_tests
+    test_sensor_bus_provision.c
+    ../sensor_bus_provision.c
+)
+target_include_directories(roadrunner_sensor_bus_provision_tests PRIVATE ..)
+
+add_test(NAME sensor_bus_provision COMMAND roadrunner_sensor_bus_provision_tests)
+
+# The TMC-UART datagram loop, over the same SDK stubs as the I2C target.
+add_executable(roadrunner_tmcuart_tests
+    test_tmcuart.c
+    ../tmcuart.c
+)
+target_include_directories(roadrunner_tmcuart_tests PRIVATE stubs ..)
+
+add_test(NAME tmcuart COMMAND roadrunner_tmcuart_tests)
+
 set(ROADRUNNER_STDIO_USB_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../main.c
     ${CMAKE_CURRENT_LIST_DIR}/../as5600.c
@@ -70,6 +88,7 @@ set(ROADRUNNER_STDIO_USB_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/../image_digest.c
     ${CMAKE_CURRENT_LIST_DIR}/../ir_sensor.c
     ${CMAKE_CURRENT_LIST_DIR}/../neopixel.c
+    ${CMAKE_CURRENT_LIST_DIR}/../sensor_bus_provision.c
     ${CMAKE_CURRENT_LIST_DIR}/../tmcuart.c
     ${CMAKE_CURRENT_LIST_DIR}/../usb_admin.c
     ${CMAKE_CURRENT_LIST_DIR}/../usb_descriptor_strings.c

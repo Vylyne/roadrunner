@@ -65,6 +65,7 @@ bool tmcuart_sync()
 }
 
 void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length);
+void sensor_bus_register_write(uint8_t reg, const uint8_t *data, size_t length);
 
 static void tmcuart_send_response(uint8_t reg)
 {
@@ -91,25 +92,41 @@ static void tmcuart_send_response(uint8_t reg)
 
 void tmcuart_loop()
 {
-    uint8_t cmd[4] = { 0xf5, 0, 0, 0 };
-    uint8_t addr, reg, crc;
+    /* Read: sync, addr, reg, crc.
+     * Write: sync, addr, reg | 0x80, four data bytes, crc - Klipper's
+     * tmc_uart sets bit 7 of the register byte to mean write, and the CRC
+     * covers everything before it. The two frames differ in length, so the
+     * write bit decides how much to read before the CRC can be checked. */
+    uint8_t cmd[8] = { 0xf5, 0, 0, 0, 0, 0, 0, 0 };
+    uint8_t addr, reg;
 
     if (!tmcuart_sync())
         return;
 
-    tmcuart_read(&cmd[1], 3);
+    tmcuart_read(&cmd[1], 2);
 
     addr = cmd[1];
     reg = cmd[2];
-    crc = cmd[3];
+    // Both UART images enable USB CDC stdio for the admin protocol, so a bad
+    // frame cannot be printf'd without colliding with protocol frames on the
+    // same CDC interface. Bad frames are silently dropped.
+    (void)addr;
 
-    if(crc != tmcuart_crc8((uint8_t *)&cmd, 3)) {
-        // Both UART images enable USB CDC stdio for the admin protocol, so
-        // this diagnostic cannot be printf'd without colliding with protocol
-        // frames on the same CDC interface. Silently drop the bad frame.
-        (void)addr;
+    if (reg & 0x80) {
+        tmcuart_read(&cmd[3], 5);
+        if (cmd[7] != tmcuart_crc8((uint8_t *)&cmd, 7))
+            return;
+
+        // Writes get no reply: the datagram has no acknowledgement, which is
+        // what Klipper expects. A refused write is indistinguishable from an
+        // accepted one on the wire.
+        sensor_bus_register_write(reg & 0x7f, &cmd[3], 4);
         return;
     }
+
+    tmcuart_read(&cmd[3], 1);
+    if (cmd[3] != tmcuart_crc8((uint8_t *)&cmd, 3))
+        return;
 
     tmcuart_send_response(reg);
 }

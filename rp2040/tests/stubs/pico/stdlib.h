@@ -25,4 +25,8 @@ static inline void gpio_init(uint gpio) { (void)gpio; }
 static inline void gpio_set_function(uint gpio, int fn) { (void)gpio; (void)fn; }
 static inline void gpio_pull_up(uint gpio) { (void)gpio; }
 
+/* `tmcuart.c` paces its reply for Klipper's bit-banged receiver. Off-target
+ * there is nothing to pace. */
+static inline void sleep_us(uint64_t us) { (void)us; }
+
 #endif

@@ -103,6 +103,19 @@ void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length) {
     *length = fake_payload_length;
 }
 
+/* Stands in for main.c's write hook, recording what the handler forwards. */
+static int write_calls;
+static uint8_t written_register;
+static uint8_t written_data[4];
+static size_t written_length;
+
+void sensor_bus_register_write(uint8_t reg, const uint8_t *data, size_t length) {
+    ++write_calls;
+    written_register = reg;
+    written_length = length;
+    memcpy(written_data, data, length < 4u ? length : 4u);
+}
+
 #include "../i2c_target.c"
 
 /* ------------------------------------------------------------------
@@ -112,6 +125,8 @@ void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length) {
 static void bus_reset(void) {
     memset(&bus, 0, sizeof(bus));
     prepare_calls = 0;
+    write_calls = 0;
+    written_length = 0;
     i2c_target_init();
     assert(bus.handler != NULL);
 }
@@ -303,8 +318,8 @@ static void test_read_without_a_preceding_address_is_safe(void) {
     assert(prepare_calls == 0);
 }
 
-/* Bytes written after the register address are discarded - the register
- * interface is read-only - and must not be mistaken for a new address. */
+/* Bytes written after the register address are register data, handed to the
+ * write hook, and must not be mistaken for a new address. */
 static void test_further_written_bytes_do_not_rebind_the_register(void) {
     static const uint8_t two_bytes[] = {0xAA, 0xBB};
 
@@ -319,6 +334,66 @@ static void test_further_written_bytes_do_not_rebind_the_register(void) {
     assert(prepare_calls == 1);
     assert(bus.rx[0] == 0xAA);
     assert(bus.rx[1] == 0xBB);
+    assert(write_calls == 1);
+    assert(written_register == 0x33);
+    assert(written_length == 1u);
+    assert(written_data[0] == 0x99);
+}
+
+/* A staging write: address, four data bytes, Stop. The hook sees the whole
+ * write once, at the Stop, in the order the master sent it. */
+static void test_a_register_write_is_forwarded_at_the_stop(void) {
+    bus_reset();
+
+    master_writes(0x50);
+    master_writes(0x12);
+    master_writes(0x34);
+    master_writes(0x56);
+    master_writes(0x78);
+    assert(write_calls == 0);
+    master_signals_start_or_stop();
+
+    assert(write_calls == 1);
+    assert(written_register == 0x50);
+    assert(written_length == 4u);
+    assert(written_data[0] == 0x12 && written_data[1] == 0x34);
+    assert(written_data[2] == 0x56 && written_data[3] == 0x78);
+
+    /* The next FINISH has nothing to forward. */
+    master_signals_start_or_stop();
+    assert(write_calls == 1);
+}
+
+/* An ordinary register read - address, repeated START, read, Stop - is not a
+ * write, and must never reach the hook. */
+static void test_a_register_read_forwards_no_write(void) {
+    build_long_payload(0x10);
+
+    bus_reset();
+    set_register(0x31, long_payload, sizeof(long_payload));
+
+    master_writes(0x31);
+    master_signals_start_or_stop();
+    master_reads(4u);
+    master_signals_start_or_stop();
+
+    assert(write_calls == 0);
+}
+
+/* An oversized write keeps its true length, so the stage can refuse it rather
+ * than accept its first four bytes as a chunk. */
+static void test_an_oversized_write_reports_its_full_length(void) {
+    bus_reset();
+
+    master_writes(0x50);
+    for (uint8_t byte = 1; byte <= 6; ++byte) {
+        master_writes(byte);
+    }
+    master_signals_start_or_stop();
+
+    assert(write_calls == 1);
+    assert(written_length == 6u);
+    assert(written_data[0] == 1 && written_data[3] == 4);
 }
 
 int main(void) {
@@ -331,5 +406,8 @@ int main(void) {
     test_unknown_register_serves_only_filler();
     test_read_without_a_preceding_address_is_safe();
     test_further_written_bytes_do_not_rebind_the_register();
+    test_a_register_write_is_forwarded_at_the_stop();
+    test_a_register_read_forwards_no_write();
+    test_an_oversized_write_reports_its_full_length();
     return 0;
 }

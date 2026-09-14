@@ -10,6 +10,7 @@
 
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
+#include "hardware/sync.h"
 #include "hardware/watchdog.h"
 #include "pico/unique_id.h"
 #include "tusb.h"
@@ -24,6 +25,7 @@
 #include "usb_admin.h"
 #include "identity_registers.h"
 #include "boot_marker.h"
+#include "sensor_bus_provision.h"
 
 void rr_usb_descriptors_init(const struct rr_identity_store *store);
 
@@ -285,6 +287,39 @@ void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
         memset(buf, 0xff, *length);
 }
 
+/* Every register is read-only on every transport, except the provisioning
+ * staging registers, which accept writes only while the board is locked. Runs
+ * in the I2C target ISR on the I2C build, so it only stages. */
+void sensor_bus_register_write(uint8_t reg, const uint8_t *data, size_t length)
+{
+    (void)rr_sensor_bus_provision_write(reg, data, length,
+                                        rr_identity_registers_locked());
+}
+
+/* Apply a commit the bus validated, from the main loop: provisioning erases
+ * and programs flash, which cannot run inside the ISR that staged it.
+ *
+ * This reboots directly rather than through
+ * rr_usb_admin_acknowledge_before_application_reboot. That path exists to
+ * flush a CDC response to a USB requester; a bus commit has no USB requester,
+ * and waiting on a transmit nobody is reading could hang the board locked.
+ * The host's acknowledgement is reading the new serial back after the reboot. */
+static void service_sensor_bus_provision(const struct rr_identity_store *identity_store)
+{
+    uint8_t uuid[RR_SENSOR_BUS_PROVISION_UUID_SIZE];
+    uint32_t interrupts = save_and_disable_interrupts();
+    bool commit = rr_sensor_bus_provision_take_commit(uuid);
+
+    restore_interrupts(interrupts);
+    if(!commit)
+        return;
+
+    /* ALREADY_PROVISIONED, CONFLICT or an I/O error leaves the board as it
+     * was; the host sees an unchanged serial and reports the failure. */
+    if(rr_identity_provision(identity_store, uuid) == RR_IDENTITY_OK)
+        rr_usb_admin_reboot_application(NULL);
+}
+
 int main() {
     struct rr_identity_store identity_store;
 
@@ -292,6 +327,7 @@ int main() {
     rr_usb_descriptors_init(&identity_store);
     stdio_init_all();
     rr_usb_admin_init_for_firmware(&identity_store);
+    rr_sensor_bus_provision_reset();
 
     neopixel_init();
     sleep_ms(100);
@@ -322,6 +358,7 @@ int main() {
     while (1) {
         tud_task();
         rr_usb_admin_poll();
+        service_sensor_bus_provision(&identity_store);
         update_loop();
 
         if(rr_identity_registers_locked()
