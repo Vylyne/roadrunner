@@ -23,6 +23,7 @@
 #include "identity_store.h"
 #include "usb_admin.h"
 #include "identity_registers.h"
+#include "boot_marker.h"
 
 void rr_usb_descriptors_init(const struct rr_identity_store *store);
 
@@ -127,6 +128,7 @@ static void rr_usb_admin_init_for_firmware(
 #define READ_FILAMENT_PRESENCE      0x22
 #define READ_FULL_TURNS             0x23
 #define READ_ANGLE                  0x24
+#define READ_BOOT_MARKER            0x25
 
 #define MAGNET_STATE_UNKNOWN        0
 #define MAGNET_STATE_NOT_DETECTED   1
@@ -267,6 +269,9 @@ void prepare_register_data(uint8_t reg, uint8_t *buf, size_t *length)
         MEMCPY_REG_DATA(buf, state.full_turns, *length);
     } else if(reg == READ_ANGLE) {
         MEMCPY_REG_DATA(buf, state.angle, *length);
+    } else if(reg == READ_BOOT_MARKER) {
+        uint32_t boot_marker = rr_boot_marker_ms(time_us_64());
+        MEMCPY_REG_DATA(buf, boot_marker, *length);
     }
 
     /* An unprovisioned board answers, but says nothing. Silence is not an

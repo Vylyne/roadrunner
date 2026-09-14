@@ -91,13 +91,14 @@ REGISTERS = {
     0x22: ("READ_FILAMENT_PRESENCE", 1),
     0x23: ("READ_FULL_TURNS", 4),
     0x24: ("READ_ANGLE", 4),
+    0x25: ("READ_BOOT_MARKER", 4),
     0x30: ("READ_IDENTITY_STATE", 1),
     0x31: ("READ_SERIAL", 32),
     0x32: ("READ_FIRMWARE_VERSION", 32),
     0x33: ("READ_VARIANT", 2),
     0x34: ("READ_FLASH_UID", 8),
 }
-SENSOR_REGISTERS = (0x10, 0x21, 0x22, 0x23, 0x24)
+SENSOR_REGISTERS = (0x10, 0x21, 0x22, 0x23, 0x24, 0x25)
 IDENTITY_REGISTERS = (0x30, 0x31, 0x32, 0x33, 0x34)
 
 # Exit codes.  Distinct enough that a wrapper script can tell "no board" from
@@ -764,6 +765,8 @@ def decode_register(reg: int, payload: bytes) -> str:
         return str(payload[0])
     if reg in (0x23, 0x24):
         return str(struct.unpack("<l", payload)[0])
+    if reg == 0x25:
+        return f"{struct.unpack('<L', payload)[0]} ms since boot"
     if reg == 0x30:
         return describe_identity_state(payload[0])
     if reg in (0x31, 0x32):

@@ -9,6 +9,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 EXTRA = (
     Path(__file__).resolve().parents[1]
@@ -454,6 +456,7 @@ def _bare_sensor(module, reader):
     sensor._identity = None
     sensor._firmware_image = None
     sensor._identity_next_attempt = 0.
+    sensor._boot_marker_supported = None
     sensor.errors = []
     sensor._respond_error = sensor.errors.append
     return sensor
@@ -552,6 +555,7 @@ def test_a_locked_board_explains_itself_instead_of_looking_dead(monkeypatch):
     sensor._reads_ok = 0
     sensor._reads_failed = 0
     sensor._consecutive_failures = 0
+    sensor._resets = 0
     sensor._inspect_commanded_move = lambda eventtime: None
     sensor._sensor_connected = module.TriggerOnChange(None, lambda *a: None)
     sensor._filament_present = module.TriggerOnChange(None, lambda *a: None)
@@ -756,4 +760,288 @@ def test_a_pyserial_without_exclusive_still_connects(monkeypatch, caplog):
     assert len(calls) == 1
     assert "exclusive" not in calls[0]
     assert any("exclusive access" in message for message in caplog.messages)
+
+
+# --- Boot marker (register 0x25) -------------------------------------------
+
+DETECTED = 4
+UNKNOWN = 0
+LOCKED_MARKER = 0xffffffff
+
+
+class ScriptedBoard:
+    """A board replaying one frame per poll.
+
+    A frame is (magnet_state, turns, angle, boot_ms). A frame of None is a
+    poll where the board does not answer at all; a boot_ms of None is a poll
+    where only the marker read fails.
+    """
+
+    def __init__(self, module, frames, marker_supported=True):
+        self.module = module
+        self.frames = list(frames)
+        self.frame = None
+        self.marker_supported = marker_supported
+        self.marker_reads = 0
+
+    def read(self):
+        self.frame = self.frames.pop(0)
+        if self.frame is None:
+            return None
+        magnet, turns, angle, _ = self.frame
+        return self.module.SensorRegister(magnet, 1, turns, angle)
+
+    def read_reg(self, reg, length):
+        assert (reg, length) == (0x25, 4)
+        self.marker_reads += 1
+        if not self.marker_supported or self.frame[3] is None:
+            return None
+        return bytearray(struct.pack("<L", self.frame[3]))
+
+
+def _polling_sensor(module, board):
+    """A sensor that can run the real poll, with position in raw counts."""
+
+    class Reactor:
+        def monotonic(self):
+            return 0.
+
+    sensor = _bare_sensor(module, board)
+    sensor._identity = object()
+    sensor._update_identity = lambda eventtime: None
+    sensor._inspect_commanded_move = lambda eventtime: None
+    sensor.reactor = Reactor()
+    sensor.infos = []
+    sensor._respond_info = lambda msg, log=False: sensor.infos.append(msg)
+    sensor.serial_port = None
+    sensor._device_path = None
+    sensor._reads_ok = 0
+    sensor._reads_failed = 0
+    sensor._consecutive_failures = 0
+    sensor._resets = 0
+    sensor._last_boot_ms = None
+    sensor._boot_marker_failures = 0
+    sensor._rebase_pending = False
+    sensor._rebase_detected_polls = 0
+    sensor._position_offset = 0.
+    sensor._sensor_connected = module.TriggerOnChange(None, lambda *a: None)
+    sensor._filament_present = module.TriggerOnChange(None, lambda *a: None)
+    sensor._underextruding = module.TriggerOnChange(False, lambda *a: None)
+    sensor._runout = module.TriggerOnChange(False, lambda *a: None)
+    sensor._magnet_state = module.MagnetState(0xff)
+    sensor._status_evaluation_move = None
+    sensor._is_printing = False
+    # 12 bits, nothing ignored, and a rotation distance that makes one raw
+    # count one millimetre: position is turns * 4095 + angle.
+    sensor._rotation_helper = module.SensorRotationHelper(12, 0)
+    sensor.rotation_distance = 4095.
+    sensor.invert_direction = False
+    sensor.position = 0.
+    sensor.motion_triggers = 0
+
+    def motion(eventtime, state):
+        sensor.motion_triggers += 1
+
+    sensor._motion_callbacks = [motion]
+    sensor._motion_callback_state = True
+    sensor._commanded_moves = []
+    return sensor
+
+
+def _poll_all(sensor, board):
+    positions = []
+    while board.frames:
+        sensor._update_state_from_sensor()
+        positions.append(sensor.position)
+    return positions
+
+
+def test_an_increasing_marker_leaves_position_tracking_untouched(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 0, 100, 1000),
+        (DETECTED, 0, 200, 1100),
+        (DETECTED, 1, 5, 1200),
+        (DETECTED, 1, 50, 1300),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    assert _poll_all(sensor, board) == pytest.approx([100., 200., 4100., 4145.])
+    assert sensor._resets == 0
+    assert sensor.infos == []
+
+
+def test_a_lower_marker_is_a_reset_and_invents_no_distance(monkeypatch):
+    """The brownout jump: without this, the first post-reset poll reports a
+    distance the size of everything measured so far."""
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 3, 100, 60000),
+        (DETECTED, 3, 200, 60100),
+        # The board restarts: a zeroed state until its encoder loop runs.
+        (UNKNOWN, 0, 0, 150),
+        (UNKNOWN, 0, 0, 250),
+        # The first real angle can take the turn count to -1.
+        (DETECTED, -1, 3000, 1200),
+        (DETECTED, -1, 3000, 1300),
+        # Moving again, from wherever the old count left off.
+        (DETECTED, -1, 3010, 1400),
+        (DETECTED, -1, 3040, 1500),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    positions = _poll_all(sensor, board)
+
+    before = 3 * 4095. + 200
+    assert positions == pytest.approx(
+        [3 * 4095. + 100] + [before] * 5 + [before + 10, before + 40])
+    assert sensor._resets == 1
+    assert sensor._reads_failed == 0
+    assert len(sensor.infos) == 1
+
+
+def test_a_reset_is_counted_in_connection_status_not_as_a_read_failure(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 0, 100, 5000),
+        (DETECTED, 0, 100, 10),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    _poll_all(sensor, board)
+    sensor._identity = None  # only the stand-in the poll needed
+    sensor.runout_helper = types.SimpleNamespace(sensor_enabled=True)
+    connection = sensor.get_status(0.)["connection"]
+
+    assert connection["resets"] == 1
+    assert connection["reads_failed"] == 0
+
+
+def test_the_reset_rebase_emits_no_motion(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 2, 0, 9000),
+        (DETECTED, 0, 7, 100),
+        (DETECTED, 0, 7, 200),
+        (DETECTED, 0, 7, 300),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    sensor._update_state_from_sensor()
+    triggers = sensor.motion_triggers
+    _poll_all(sensor, board)
+
+    assert sensor.motion_triggers == triggers
+    assert sensor.position == pytest.approx(2 * 4095.)
+
+
+def test_a_saturated_marker_never_reads_as_a_reset(monkeypatch):
+    module = _load_extra(monkeypatch)
+    markers = [0xfffffffc, 0xfffffffd, 0xfffffffe, 0xfffffffe, 0xfffffffe]
+    board = ScriptedBoard(module, [
+        (DETECTED, 0, i, marker) for i, marker in enumerate(markers)
+    ])
+    sensor = _polling_sensor(module, board)
+
+    assert _poll_all(sensor, board) == pytest.approx([0., 1., 2., 3., 4.])
+    assert sensor._resets == 0
+
+
+def test_the_locked_fill_is_not_a_marker(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 0, 10, 5000),
+        (DETECTED, 0, 20, LOCKED_MARKER),
+        (DETECTED, 0, 30, 5200),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    _poll_all(sensor, board)
+
+    assert sensor._resets == 0
+    assert sensor._last_boot_ms == 5200
+
+
+def test_a_failed_marker_read_holds_position_without_failing_the_read(monkeypatch):
+    """Once a board has answered 0x25, a reading without it cannot be told
+    apart from one taken after a reset."""
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 0, 10, 5000),
+        (DETECTED, 0, 20, None),
+        (DETECTED, 0, 30, 5200),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    assert _poll_all(sensor, board) == pytest.approx([10., 10., 30.])
+    assert sensor._reads_failed == 0
+    assert sensor._resets == 0
+
+
+def test_a_power_cycle_is_a_disconnect_then_a_reset(monkeypatch):
+    """The marker survives the disconnect, or the reset it exists to catch
+    would be forgotten on the way back."""
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 1, 0, 30000),
+        None,
+        None,
+        (UNKNOWN, 0, 0, 120),
+        (DETECTED, 0, 900, 1150),
+        (DETECTED, 0, 900, 1250),
+        (DETECTED, 0, 905, 1350),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    positions = _poll_all(sensor, board)
+
+    assert positions == pytest.approx([4095.] * 6 + [4100.])
+    assert sensor._resets == 1
+    assert sensor._reads_failed == 2
+
+
+def test_a_reset_drops_the_moves_it_interrupted(monkeypatch):
+    """A move measured across a reset is missing whatever moved while the
+    board was down, and would read as underextrusion."""
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [
+        (DETECTED, 0, 10, 5000),
+        (DETECTED, 0, 0, 10),
+    ])
+    sensor = _polling_sensor(module, board)
+
+    sensor._update_state_from_sensor()
+    sensor._commanded_moves = [types.SimpleNamespace(ended=True)]
+    sensor._update_state_from_sensor()
+
+    assert sensor._commanded_moves == []
+
+
+def test_firmware_without_the_marker_is_left_alone(monkeypatch):
+    """Released firmware has no 0x25. It keeps reporting position as it always
+    has, and is asked for the marker only until it has plainly not got one."""
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(
+        module, [(DETECTED, 0, i, None) for i in range(25)],
+        marker_supported=False)
+    sensor = _polling_sensor(module, board)
+
+    positions = _poll_all(sensor, board)
+
+    assert positions == pytest.approx([float(i) for i in range(25)])
+    assert board.marker_reads == module.BOOT_MARKER_GIVE_UP
+    assert sensor._boot_marker_supported is False
+    assert sensor._resets == 0
+
+
+def test_a_board_that_has_not_answered_identity_is_not_asked(monkeypatch):
+    module = _load_extra(monkeypatch)
+    board = ScriptedBoard(module, [(DETECTED, 0, 1, 100)])
+    sensor = _polling_sensor(module, board)
+    sensor._identity = None
+
+    _poll_all(sensor, board)
+
+    assert board.marker_reads == 0
+    assert sensor.position == pytest.approx(1.)
 

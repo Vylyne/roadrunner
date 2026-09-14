@@ -299,7 +299,7 @@ forwarding it. The register is never read and both state machines are left
 mid-sequence.
 
 No current or planned register hits this — the sensor registers are
-`0x20`–`0x24`, identity is `0x30`–`0x49`, staging is `0x50`–`0x54` and is not
+`0x20`–`0x25`, identity is `0x30`–`0x49`, staging is `0x50`–`0x54` and is not
 used on this transport. It is written down because the next person to allocate a
 register number has no other way to know.
 

@@ -21,6 +21,14 @@ CHECK_RUNOUT_TIMEOUT = .100 # read sensor value at this interval
 # once; this only paces the retries.
 IDENTITY_RETRY_TIMEOUT = 10.
 
+# Consecutive failed reads of the boot marker (register 0x25) before the extra
+# stops relying on it. Firmware that predates the register never answers it.
+BOOT_MARKER_GIVE_UP = 10
+# A board fresh out of reset reports a zeroed state until its encoder loop is
+# running, and the first angle it reads can move the turn count. Position is
+# rebased only once this many consecutive polls have seen the magnet detected.
+REBASE_DETECTED_POLLS = 2
+
 VIRTUAL_MOTION_PREFIX = 'virtual_motion_sensor'
 VIRTUAL_SWITCH_PREFIX = 'virtual_switch_sensor'
 
@@ -239,6 +247,10 @@ class SensorRegister:
     FILAMENT_PRESENCE = 0x22
     FULL_TURNS = 0x23
     ANGLE = 0x24
+    # Milliseconds since boot, saturating at 0xfffffffe; only a reset lowers
+    # it. 0xffffffff is the locked-board fill, never a value.
+    BOOT_MARKER = 0x25
+    BOOT_MARKER_LOCKED = 0xffffffff
 
     def __init__(self, magnet_state, filament_presence, full_turns, angle):
         self.magnet_state = magnet_state
@@ -431,7 +443,7 @@ class RegisterReaderUART(RegisterReaderGeneric):
     # worth asking for. IMAGE_RANGE is binary and 0x00000000 is a legal start
     # address, so a zero byte there is a value and it is always read in full.
     TEXT_REGISTERS = (IdentityRegister.SERIAL, IdentityRegister.FIRMWARE_VERSION)
-    # A full identity is up to 18 chunk transactions, on top of the four the
+    # A full identity is up to 18 chunk transactions, on top of the five the
     # sensor poll makes itself. Spread them over polls instead of stalling one.
     CHUNKS_PER_ATTEMPT = 6
 
@@ -976,6 +988,17 @@ class HighResolutionFilamentSensor:
         self._reads_failed = 0
         self._consecutive_failures = 0
 
+        # Reset detection. The marker is kept across disconnects: a power cycle
+        # is a disconnect followed by a reset, and forgetting the old value on
+        # reconnect would hide exactly the reset it exists to catch.
+        self._resets = 0
+        self._last_boot_ms : typing.Optional[int] = None
+        self._boot_marker_supported : typing.Optional[bool] = None
+        self._boot_marker_failures = 0
+        self._rebase_pending = False
+        self._rebase_detected_polls = 0
+        self._position_offset = 0.
+
         # Internal sensor state
         self._magnet_state = MagnetState(0xff)
         self._sensor_connected = TriggerOnChange(None, self._sensor_connected_changed)
@@ -1164,6 +1187,7 @@ class HighResolutionFilamentSensor:
                 "reads_ok": self._reads_ok,
                 "reads_failed": self._reads_failed,
                 "consecutive_failures": self._consecutive_failures,
+                "resets": self._resets,
             },
             "magnet_state": str(self._magnet_state),
             "filament_detected": bool(self._filament_present),
@@ -1228,6 +1252,9 @@ class HighResolutionFilamentSensor:
             self._firmware_image = None
             self._identity_next_attempt = 0.
             self.regs.discard_partial_reads()
+            if self._boot_marker_supported is False:
+                # It may have come back running newer firmware.
+                self._boot_marker_supported = None
         if new_value:
             self._respond_info("Reconnected")
         else:
@@ -1306,6 +1333,56 @@ class HighResolutionFilamentSensor:
                 self._firmware_image = image
                 logging.info(f"{self.name}: firmware image {image!r}")
 
+    def _read_boot_marker(self) -> typing.Optional[int]:
+        """ Milliseconds since the board booted, or None when there is no
+        usable value this poll.
+
+        Only asked of a board that has answered the identity window at least
+        once or has answered this register before: firmware older than the
+        identity window has no 0x25 either, and an unknown register is not a
+        failure worth a warning on every poll. """
+        if self._boot_marker_supported is False:
+            return None
+        if self._boot_marker_supported is None and self._identity is None:
+            return None
+
+        data = self.regs.read_reg(SensorRegister.BOOT_MARKER, 4)
+        marker = struct.unpack('<L', data)[0] if data and len(data) == 4 else None
+        if marker == SensorRegister.BOOT_MARKER_LOCKED:
+            marker = None
+
+        if marker is not None:
+            self._boot_marker_supported = True
+            self._boot_marker_failures = 0
+            return marker
+
+        self._boot_marker_failures += 1
+        if self._boot_marker_failures >= BOOT_MARKER_GIVE_UP:
+            logging.info(
+                f"{self.name}: the board is not answering the boot marker "
+                f"register (0x{SensorRegister.BOOT_MARKER:02x}), so a board "
+                f"reset cannot be told apart from a bus dropout until it "
+                f"reconnects")
+            self._boot_marker_supported = False
+            self._boot_marker_failures = 0
+        return None
+
+    def _board_reset(self, boot_ms):
+        """ The boot marker went down: the board restarted since the last poll.
+
+        Its turn count restarted with it, so the next reading is unrelated to
+        the last one. Position is held until the encoder is reporting again,
+        then rebased. The commanded moves are dropped because a measurement
+        that spans the reset is missing whatever moved while the board was
+        down, and would read as underextrusion. """
+        self._resets += 1
+        self._rebase_pending = True
+        self._rebase_detected_polls = 0
+        self.clear_move_queue()
+        self._respond_info(
+            f"Board reset detected ({boot_ms} ms since boot); position will be "
+            f"rebased with no distance recorded across the reset", log=True)
+
     def _update_state_from_sensor(self):
         """ Read data from sensor and sets the internal state to match. """
 
@@ -1328,10 +1405,39 @@ class HighResolutionFilamentSensor:
         self._magnet_state = MagnetState(regs.magnet_state)
         self._filament_present.set(regs.filament_presence == 1, eventtime)
 
+        # Read after the sensor registers, not before: a reset landing between
+        # the two reads then shows up as a lower marker on this poll, instead
+        # of a post-reset reading slipping through under a pre-reset marker.
+        boot_ms = self._read_boot_marker()
+        if boot_ms is not None:
+            if self._last_boot_ms is not None and boot_ms < self._last_boot_ms:
+                self._board_reset(boot_ms)
+            self._last_boot_ms = boot_ms
+        elif self._boot_marker_supported:
+            # This reading cannot be told apart from one taken after a reset,
+            # so it moves nothing. The next poll catches up.
+            return
+
         self._rotation_helper.update_raw(regs.full_turns, regs.angle)
 
         inv = (-1 if self.invert_direction else 1)
-        new_position = self.rotation_distance * (self._rotation_helper.absolute_angular_position() * inv) / 360.
+        sensor_position = self.rotation_distance * (self._rotation_helper.absolute_angular_position() * inv) / 360.
+
+        if self._rebase_pending:
+            if self._magnet_state.value != MagnetState.DETECTED:
+                self._rebase_detected_polls = 0
+                return
+            self._rebase_detected_polls += 1
+            if self._rebase_detected_polls < REBASE_DETECTED_POLLS:
+                return
+            # Carry on from where the old count left off. Whatever moved while
+            # the board was down is lost, and no distance is invented for it.
+            self._position_offset = self.position - sensor_position
+            self._rebase_pending = False
+            logging.info(f"{self.name}: position rebased at {self.position} after a board reset")
+            return
+
+        new_position = sensor_position + self._position_offset
         distance = new_position - self.position
         self.position = new_position
 

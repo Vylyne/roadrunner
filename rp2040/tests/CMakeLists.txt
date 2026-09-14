@@ -39,6 +39,13 @@ target_include_directories(roadrunner_image_digest_tests PRIVATE ..)
 
 add_test(NAME image_digest COMMAND roadrunner_image_digest_tests)
 
+add_executable(roadrunner_boot_marker_tests
+    test_boot_marker.c
+)
+target_include_directories(roadrunner_boot_marker_tests PRIVATE ..)
+
+add_test(NAME boot_marker COMMAND roadrunner_boot_marker_tests)
+
 # The I2C target's register-serving state machine, driven off-target.
 #
 # `i2c_target.c` is not listed as a source: the test #includes it, because the

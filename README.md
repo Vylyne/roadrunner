@@ -219,9 +219,18 @@ necessarily the board that left.
     "device_path": "/dev/ttyACM0",     # what that resolves to
     "reads_ok": 1234,
     "reads_failed": 0,
-    "consecutive_failures": 0
+    "consecutive_failures": 0,
+    "resets": 0                        # board restarts seen, never read failures
 }
 ```
+
+`connection.resets` counts board restarts. The firmware serves milliseconds
+since boot at register `0x25`, saturating at `0xfffffffe` rather than wrapping,
+so the value only goes down when the board resets. When it does, the extra
+holds the reported position until the encoder is reading again, rebases, and
+records no distance across the reset, so a brownout no longer shows up as one
+huge extrusion. Moves in flight at the reset are dropped rather than measured
+short. Firmware without `0x25` is asked a few times and then left alone.
 
 A host tool matches `identity.serial` against the USB serial descriptor of an
 attached board, and `connection.device_path` against the port it enumerated

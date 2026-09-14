@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 /* The identity window. Chosen to clear the sensor map, which uses 0x10 and
- * 0x20-0x24 (0x20 is reserved for the commented-out READ_HEALTH). These
+ * 0x20-0x25 (0x20 is reserved for the commented-out READ_HEALTH). These
  * registers are readable whether or not the board is provisioned - they are
  * both the unprovisioned allow-list and the steady-state identity source.
  * Field order mirrors the USB admin INFO payload deliberately, so
